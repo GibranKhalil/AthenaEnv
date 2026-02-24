@@ -116,7 +116,7 @@ static JSValue athena_socket_recv(JSContext *ctx, JSValue this_val, int argc, JS
 
     void* buf = js_mallocz(ctx, len);
 
-    recv(s->id, buf, len, MSG_PEEK);
+    recv(s->id, buf, len, MSG_DONTWAIT);
     return JS_NewStringLen(ctx, buf, len);
 }
 
