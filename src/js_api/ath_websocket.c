@@ -112,6 +112,17 @@ static JSValue athena_ws_send(JSContext *ctx, JSValue this_val, int argc, JSValu
     return JS_NewUint32(ctx, size);
 }
 
+static JSValue athena_ws_close(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv)
+{
+    ath_ws_ctx_t *ws = (ath_ws_ctx_t*)JS_GetOpaque2(ctx, this_val, js_ws_class_id);
+    if (!ws)
+        return JS_UNDEFINED;
+
+    ath_ws_close(ws);
+    JS_SetOpaque(this_val, NULL);
+    return JS_UNDEFINED;
+}
+
 static JSClassDef js_ws_class = {
     "WebSocket",
     .finalizer = athena_ws_dtor,
@@ -121,6 +132,7 @@ static const JSCFunctionListEntry athena_ws_funcs[] = {
     JS_CGETSET_MAGIC_DEF("verifyTLS", athena_ws_get, athena_ws_set, 0),
     JS_CFUNC_DEF("send", 1, athena_ws_send),
     JS_CFUNC_DEF("recv", 0, athena_ws_recv),
+	JS_CFUNC_DEF("close", 0, athena_ws_close),
 };
 
 static int ws_init(JSContext *ctx, JSModuleDef *m) {
