@@ -47,13 +47,18 @@ static JSValue athena_socket_connect(JSContext *ctx, JSValue this_val, int argc,
 
     struct sockaddr_in addr;
     int32_t sin_port;
+	const char* ip_str;
 
     JSSocketData* s = JS_GetOpaque2(ctx, this_val, js_socket_class_id);
+
+	ip_str = JS_ToCString(ctx, argv[0]);
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_len = sizeof(addr);
     addr.sin_family = s->sin_family;
-    addr.sin_addr.s_addr = ipaddr_addr(JS_ToCString(ctx, argv[0]));
+    addr.sin_addr.s_addr = ipaddr_addr(ip_str);
+
+	JS_FreeCString(ctx, ip_str);
 
     JS_ToInt32(ctx, &sin_port, argv[1]);
     addr.sin_port = htons(sin_port);
@@ -68,15 +73,20 @@ static JSValue athena_socket_bind(JSContext *ctx, JSValue this_val, int argc, JS
 
     struct sockaddr_in addr;
     int32_t sin_port;
+	const char* ip_str;
 
     JSSocketData* s = JS_GetOpaque2(ctx, this_val, js_socket_class_id);
+	ip_str = JS_ToCString(ctx, argv[0]);
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_len = sizeof(addr);
     addr.sin_family = s->sin_family;
-    addr.sin_addr.s_addr = ipaddr_addr(JS_ToCString(ctx, argv[0]));
+    addr.sin_addr.s_addr = ipaddr_addr(ip_str);
+	
     JS_ToInt32(ctx, &sin_port, argv[1]);
     addr.sin_port = htons(sin_port);
+
+	JS_FreeCString(ctx, ip_str);
 
     int ret = bind(s->id, (struct sockaddr*)&addr, sizeof(addr));
 
@@ -93,6 +103,8 @@ static JSValue athena_socket_send(JSContext *ctx, JSValue this_val, int argc, JS
 
     int ret = send(s->id, buf, len, MSG_DONTWAIT);
 
+	JS_FreeCString(ctx, buf);
+	
     return JS_NewInt32(ctx, ret);
 }
 
@@ -116,7 +128,10 @@ static JSValue athena_socket_recv(JSContext *ctx, JSValue this_val, int argc, JS
 
     void* buf = js_mallocz(ctx, len);
 
-    recv(s->id, buf, len, MSG_PEEK);
+    recv(s->id, buf, len, MSG_DONTWAIT);
+
+	js_free(ctx, buf);
+	
     return JS_NewStringLen(ctx, buf, len);
 }
 
