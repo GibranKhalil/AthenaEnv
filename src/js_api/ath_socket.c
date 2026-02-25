@@ -119,7 +119,7 @@ static JSValue athena_socket_listen(JSContext *ctx, JSValue this_val, int argc, 
 }
 
 static JSValue athena_socket_recv(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
-	if (argc != 1) return JS_ThrowSyntaxError(ctx, "Socket.recv takes a single argument");
+    if (argc != 1) return JS_ThrowSyntaxError(ctx, "Socket.recv takes a single argument");
 
     JSSocketData* s = JS_GetOpaque2(ctx, this_val, js_socket_class_id);
 
@@ -128,11 +128,18 @@ static JSValue athena_socket_recv(JSContext *ctx, JSValue this_val, int argc, JS
 
     void* buf = js_mallocz(ctx, len);
 
-    recv(s->id, buf, len, MSG_DONTWAIT);
+    int received = recv(s->id, buf, len, MSG_DONTWAIT);
 
-	js_free(ctx, buf);
-	
-    return JS_NewStringLen(ctx, buf, len);
+    JSValue result;
+    if (received > 0) {
+        result = JS_NewStringLen(ctx, buf, received);
+    } else {
+        result = JS_NewString(ctx, "");
+    }
+
+    js_free(ctx, buf);
+
+    return result;
 }
 
 static JSClassDef js_socket_class = {
