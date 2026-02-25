@@ -14,8 +14,12 @@ static JSClassID js_socket_class_id;
 
 static JSValue athena_socket_close(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv){
     JSSocketData* s = JS_GetOpaque2(ctx, this_val, js_socket_class_id);
+	if (!s)
+        return JS_UNDEFINED;
+	
 	lwip_close(s->id);
-
+    js_free(ctx, s);
+    JS_SetOpaque(this_val, NULL);
 	return JS_UNDEFINED;
 }
 
@@ -142,9 +146,18 @@ static JSValue athena_socket_recv(JSContext *ctx, JSValue this_val, int argc, JS
     return result;
 }
 
+static void js_socket_finalizer(JSRuntime *rt, JSValue val) {
+    JSSocketData *s = JS_GetOpaque(val, js_socket_class_id);
+    if (s) {
+        if (s->id >= 0)
+            lwip_close(s->id);
+        js_free_rt(rt, s);
+    }
+}
+
 static JSClassDef js_socket_class = {
     "Socket",
-    //.finalizer = js_s_finalizer,
+    .finalizer = js_socket_finalizer,
 }; 
 
 static const JSCFunctionListEntry js_socket_proto_funcs[] = {
