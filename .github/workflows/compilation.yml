@@ -1,5 +1,4 @@
 name: CI
-
 on:
   push:
     branches:
@@ -16,53 +15,96 @@ jobs:
     runs-on: ubuntu-latest
     container: ghcr.io/ps2homebrew/ps2homebrew:main
     steps:
-    - name: git checkout
-      uses: actions/checkout@v4
+      - name: git checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for tag history and version calculation
 
-    - name: Workaround permission issue
-      run: |
-        git config --global --add safe.directory /__w/AthenaEnv/AthenaEnv
-        git fetch --prune --unshallow
+      - name: Workaround permission issue
+        run: |
+          git config --global --add safe.directory /__w/AthenaEnv/AthenaEnv
+          git fetch --prune --tags
 
-    - name: Compile project
-      run: |
-        chmod +x build-exports.sh
-        make clean all
-      env:
-        ATHENAENV_SRC: "/__w/AthenaEnv/AthenaEnv/src"
+      - name: Compile project
+        run: |
+          chmod +x build-exports.sh
+          make clean all
+        env:
+          ATHENAENV_SRC: "/__w/AthenaEnv/AthenaEnv/src"
 
-    - name: Get short SHA
-      id: slug
-      run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_ENV
+      - name: Get short SHA
+        id: slug
+        run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_ENV
 
-    - name: Upload artifacts
-      if: ${{ success() }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: AthenaEnv-${{ steps.slug.outputs.sha8 }}
-        path: bin
+      - name: Calculate version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # Triggered by a tag push — use it as-is
+            VERSION="${GITHUB_REF#refs/tags/}"
+            echo "is_tag=true"   >> $GITHUB_ENV
+          else
+            # Find the most recent vX.Y.Z tag reachable from HEAD
+            LAST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' \
+                        --sort=-version:refname | head -n1)
 
-    - name: Compress & Rename bin folder
-      run: |
-        mv bin/ AthenaEnv/
-        tar -zcvf AthenaEnv.tar.gz AthenaEnv
+            if [ -z "$LAST_TAG" ]; then
+              # No tag exists yet — start from v0.0.0
+              LAST_TAG="v0.0.0"
+            fi
 
+            # Strip the leading 'v' and split into parts
+            VERSION_CORE="${LAST_TAG#v}"
+            MAJOR=$(echo "$VERSION_CORE" | cut -d. -f1)
+            MINOR=$(echo "$VERSION_CORE" | cut -d. -f2)
+            PATCH=$(echo "$VERSION_CORE" | cut -d. -f3)
 
-    - name: Create Pre-release
-      if: github.ref == 'refs/heads/main'
-      uses: mathieucarbou/marvinpinto-action-automatic-releases@latest
-      with:
-        repo_token: "${{ secrets.GITHUB_TOKEN }}"
-        automatic_release_tag: "latest"
-        title: "Development build"
-        files: |
-               AthenaEnv.tar.gz
+            # Bump patch for the next pre-release
+            NEXT_PATCH=$((PATCH + 1))
 
-    - name: Release
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v2
-      with:
-        files: AthenaEnv.tar.gz
-        tag_name: ${{ steps.tag.outputs.VERSION }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            # How many commits since the last tag?
+            COMMIT_COUNT=$(git rev-list "${LAST_TAG}..HEAD" --count 2>/dev/null || echo "0")
+
+            SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-8)
+            VERSION="v${MAJOR}.${MINOR}.${NEXT_PATCH}-dev.${COMMIT_COUNT}+${SHORT_SHA}"
+            echo "is_tag=false" >> $GITHUB_ENV
+          fi
+
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Calculated version: ${VERSION}"
+
+      - name: Upload artifacts
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: AthenaEnv-${{ steps.version.outputs.version }}
+          path: bin
+
+      - name: Compress & Rename bin folder
+        run: |
+          mv bin/ AthenaEnv/
+          tar -zcvf AthenaEnv.tar.gz AthenaEnv
+
+      - name: Create / update "latest" pre-release
+        if: github.ref == 'refs/heads/main' && env.is_tag == 'false'
+        uses: mathieucarbou/marvinpinto-action-automatic-releases@latest
+        with:
+          repo_token: "${{ secrets.GITHUB_TOKEN }}"
+          automatic_release_tag: "latest"
+          prerelease: true
+          title: "Development build ${{ steps.version.outputs.version }}"
+          files: |
+            AthenaEnv.tar.gz
+
+      - name: Create versioned release
+        if: env.is_tag == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AthenaEnv.tar.gz
+          tag_name: ${{ steps.version.outputs.version }}
+          name: "AthenaEnv ${{ steps.version.outputs.version }}"
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
