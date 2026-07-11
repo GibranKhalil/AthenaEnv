@@ -3,7 +3,7 @@
 #include <athena/mouse.h>
 #include <libmouse.h>
 
-int athena_mouse_init(void)
+int athena_mouse_open(void)
 {
     int ret = PS2MouseInit();
     PS2MouseReset();

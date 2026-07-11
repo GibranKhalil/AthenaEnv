@@ -222,8 +222,8 @@ static void capp_draw_hud(CappScene *scene, float fps, const AthenaMemoryStats *
              fps, athena_pad_connected_count());
     athena_font_print(scene->font, 28.0f, 48.0f, line);
 
-    snprintf(line, sizeof(line), "Core: %u KiB used / %u KiB   Allocs: %u",
-             mem->used, mem->core, mem->allocs);
+    snprintf(line, sizeof(line), "Core: %u KiB used",
+             mem->used/1024);
     athena_font_print(scene->font, 28.0f, 68.0f, line);
 
     center.x = scene->width * 0.5f;

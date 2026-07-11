@@ -5,7 +5,7 @@
 
 #include <ps2cam_rpc.h>
 
-void athena_camera_init(int mode);
+void athena_camera_startup(int mode);
 int athena_camera_device_count(void);
 int athena_camera_open(int index);
 int athena_camera_close(int devid);

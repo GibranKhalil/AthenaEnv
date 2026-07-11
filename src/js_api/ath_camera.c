@@ -6,7 +6,7 @@ static JSValue js_camera_init(JSContext *ctx, JSValue this_val, int argc, JSValu
     int mode = 0;
     if (argc == 1)
         JS_ToInt32(ctx, &mode, argv[0]);
-    athena_camera_init(mode);
+    athena_camera_startup(mode);
     return JS_UNDEFINED;
 }
 

@@ -3,7 +3,7 @@
 
 static JSValue js_keyboard_init(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv)
 {
-    return JS_NewInt32(ctx, athena_keyboard_init());
+    return JS_NewInt32(ctx, athena_keyboard_open());
 }
 
 static JSValue js_keyboard_get(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv)

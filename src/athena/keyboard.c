@@ -3,7 +3,7 @@
 #include <athena/keyboard.h>
 #include <libkbd.h>
 
-int athena_keyboard_init(void)
+int athena_keyboard_open(void)
 {
     return PS2KbdInit();
 }

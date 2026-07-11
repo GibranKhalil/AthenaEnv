@@ -1439,8 +1439,8 @@ static JSValue athena_ro_get_bone_transform(JSContext *ctx, JSValue this_val, in
 static const JSCFunctionListEntry js_render_object_proto_funcs[] = {
     JS_CFUNC_DEF("render",        0,  js_drawobject),
 	JS_CFUNC_DEF("renderBounds",  0,    athena_drawbbox),
-	JS_CFUNC_DEF("free",  0,    athena_drawfree),
-	JS_CFUNC_DEF("dispose",  0,    athena_drawfree),
+	JS_CFUNC_DEF("free",  0,    js_drawfree),
+	JS_CFUNC_DEF("dispose",  0,    js_drawfree),
 
 	JS_CFUNC_DEF("getBoneTransform",  1,  athena_ro_get_bone_transform),
 
@@ -1522,7 +1522,7 @@ static JSValue athena_render_batch_ctor(JSContext *ctx, JSValueConst new_target,
     return obj;
 }
 
-static JSValue athena_render_batch_add(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_render_batch_add(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     JSRenderBatch *jb = JS_GetOpaque2(ctx, this_val, js_render_batch_class_id);
     if (!jb)
         return JS_EXCEPTION;
@@ -1542,7 +1542,7 @@ static JSValue athena_render_batch_add(JSContext *ctx, JSValueConst this_val, in
     return JS_NewUint32(ctx, athena_render_batch_size(jb->native));
 }
 
-static JSValue athena_render_batch_clear(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_render_batch_clear(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     JSRenderBatch *jb = JS_GetOpaque2(ctx, this_val, js_render_batch_class_id);
     if (!jb)
         return JS_EXCEPTION;
@@ -1555,7 +1555,7 @@ static JSValue athena_render_batch_clear(JSContext *ctx, JSValueConst this_val, 
     return JS_UNDEFINED;
 }
 
-static JSValue athena_render_batch_render(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_render_batch_render(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     JSRenderBatch *jb = JS_GetOpaque2(ctx, this_val, js_render_batch_class_id);
     if (!jb)
         return JS_EXCEPTION;
@@ -1563,7 +1563,7 @@ static JSValue athena_render_batch_render(JSContext *ctx, JSValueConst this_val,
     return JS_NewUint32(ctx, n);
 }
 
-static JSValue athena_render_batch_size(JSContext *ctx, JSValueConst this_val, int magic) {
+static JSValue js_render_batch_size(JSContext *ctx, JSValueConst this_val, int magic) {
     JSRenderBatch *jb = JS_GetOpaque2(ctx, this_val, js_render_batch_class_id);
     if (!jb)
         return JS_EXCEPTION;
@@ -1820,7 +1820,7 @@ static JSValue scene_node_prop_set(JSContext *ctx, JSValueConst this_val, JSValu
 	return JS_UNDEFINED;
 }
 
-static JSValue athena_scene_node_update(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_scene_node_update(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     JSSceneNode *node = JS_GetOpaque2(ctx, this_val, js_scene_node_class_id);
     if (!node)
         return JS_EXCEPTION;

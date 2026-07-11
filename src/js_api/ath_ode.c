@@ -395,12 +395,23 @@ static JSValue js_geom_create_sphere(JSContext *ctx, JSValueConst this_val, int 
 
 static JSValue js_geom_create_from_render_object(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     JSSpace *space = JS_GetOpaque(argv[0], js_space_class_id);
-    
     JSRenderObject *ro = JS_GetOpaque(argv[1], js_render_object_class_id);
+    athena_object_data *od;
+    athena_render_data *rd;
+
+    if (!ro || !ro->native)
+        return JS_ThrowTypeError(ctx, "expected RenderObject");
+
+    od = athena_render_object_native(ro->native);
+    if (!od || !od->data)
+        return JS_ThrowTypeError(ctx, "RenderObject has no mesh data");
+
+    rd = od->data;
 
     dTriMeshDataID tm_id = dGeomTriMeshDataCreate();
     
-    dGeomTriMeshDataBuildSingle(tm_id, ro->obj.data->positions, sizeof(VECTOR), ro->obj.data->index_count, ro->obj.data->indices, ro->obj.data->index_count, 3*sizeof(uint32_t));
+    dGeomTriMeshDataBuildSingle(tm_id, rd->positions, sizeof(VECTOR), rd->index_count,
+                                rd->indices, rd->index_count, 3 * sizeof(uint32_t));
 
     JSGeom *geom = malloc(sizeof(JSGeom));
     if (!geom) {
@@ -1241,7 +1252,7 @@ static JSValue js_joint_attach(JSContext *ctx, JSValueConst this_val, int argc, 
     JSBody *body1 = JS_GetOpaque(argv[0], js_body_class_id);
     JSBody *body2 = JS_GetOpaque(argv[1], js_body_class_id);
 
-    dJointAttach (joint->joint, body1->body, body2->body);
+    dJointAttach(joint->joint, body1->native->body, body2->native->body);
 
     return JS_UNDEFINED;
 }

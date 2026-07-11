@@ -10,7 +10,7 @@ typedef struct AthenaMouseData {
     unsigned int buttons;
 } AthenaMouseData;
 
-int athena_mouse_init(void);
+int athena_mouse_open(void);
 int athena_mouse_read(AthenaMouseData *data);
 int athena_mouse_set_boundary(int minx, int maxx, int miny, int maxy);
 unsigned int athena_mouse_get_mode(void);

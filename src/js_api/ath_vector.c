@@ -157,7 +157,7 @@ static const JSCFunctionListEntry js_vector2_proto_funcs[] = {
     JS_CFUNC_DEF("dot", 1, js_vector2_dotproduct),
     JS_CFUNC_DEF("cross", 1, js_vector2_crossproduct),
     JS_CFUNC_DEF("dist", 1, js_vector2_distance),
-    JS_CFUNC_DEF("distsqr", 1, js_vector2_distsqr),
+    JS_CFUNC_DEF("distsqr", 1, js_vector2_distancesqr),
     JS_CFUNC_DEF("toString", 0, js_vector2_tostring),
 };
 

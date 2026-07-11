@@ -3,7 +3,7 @@
 
 static JSValue js_mouse_init(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv)
 {
-    return JS_NewInt32(ctx, athena_mouse_init());
+    return JS_NewInt32(ctx, athena_mouse_open());
 }
 
 static JSValue js_mouse_get(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv)

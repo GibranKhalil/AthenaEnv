@@ -2,7 +2,7 @@
 
 #include <athena/camera.h>
 
-void athena_camera_init(int mode)
+void athena_camera_startup(int mode)
 {
     PS2CamInit(mode);
 }
