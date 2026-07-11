@@ -393,6 +393,9 @@ typedef struct IRInstr {
 | `Int32Array` | `NativeArray*` | 4 bytes | 4 | Typed array pointer |
 | `Float32Array` | `NativeArray*` | 4 bytes | 4 | Typed array pointer |
 | `Uint32Array` | `NativeArray*` | 4 bytes | 4 | Typed array pointer |
+| `DynamicInt32Array` | `NativeDynamicArray*` | 4 bytes | 4 | Dynamic array (int32 elements) |
+| `DynamicUint32Array` | `NativeDynamicArray*` | 4 bytes | 4 | Dynamic array (uint32 elements) |
+| `DynamicFloat32Array` | `NativeDynamicArray*` | 4 bytes | 4 | Dynamic array (float elements) |
 | Custom | `void*` | 4 bytes | 4 | Struct pointer |
 | `void` | - | 0 | - | No return value |
 
@@ -1218,12 +1221,17 @@ MIPS_CFLAGS += -march=r5900 -mabi=eabi
 
 ### C. Testing
 
-**Test suite:** `native_test.js`
-- 20+ test cases
-- Covers all IR opcodes
-- Struct methods validation
-- Array operations
-- Type conversions
+**Test suite:** `bin/native_test.js`
+- Manual integration script (console.log checks)
+- Covers arithmetic, Math intrinsics, structs, int64, and basic string concat/compare
+- Does not exhaustively cover all IR opcodes
+
+**Newly supported runtime features (see `native_test.js` for examples):**
+- Dynamic arrays: `.push()`, `.pop()`, `.length`, `.clear()`, `.resize()`, `.reserve()`, `.remove()`, indexing
+- String methods: literals, `.length`, `.slice()`, `.indexOf()`, `.toUpperCase()`, `.toLowerCase()`, `.trim()`, `.replace()`
+- Float/unsigned/int64 comparisons in compiled code
+- Nested calls to other `Native.compile()` functions via constant pool references
+- Unsupported bytecode opcodes fail compilation (no silent skip)
 
 ### D. References
 

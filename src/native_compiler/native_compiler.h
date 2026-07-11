@@ -93,6 +93,7 @@
      IR_STRING_LENGTH,    /* Get string length */
      IR_STRING_COMPARE,   /* Compare two strings (-1, 0, 1) */
      IR_STRING_EQUALS,    /* Check string equality (bool) */
+    IR_STRING_NE,        /* Check string inequality (bool) */
      IR_STRING_FIND,      /* Find substring (returns index or -1) */
      IR_STRING_REPLACE,   /* Replace substring */
      IR_STRING_TO_UPPER,  /* Convert to uppercase */
@@ -136,9 +137,12 @@
      IR_GT_U32,
      IR_GE_U32,
      
-     IR_EQ_F32,
-     IR_LT_F32,
-     IR_LE_F32,
+    IR_EQ_F32,
+    IR_NE_F32,
+    IR_LT_F32,
+    IR_LE_F32,
+    IR_GT_F32,
+    IR_GE_F32,
      
      /* 64-bit Comparison */
      IR_EQ_I64,
@@ -303,6 +307,21 @@
     /* Pending intrinsic call from OP_get_field2 - avoids emitting IR markers */
     NativeFuncEntry *pending_intrinsic_entry;  /* Function entry for C calls, NULL if none */
     IROp pending_intrinsic_op;                 /* IR opcode (IR_SQRT_F32, IR_ABS_F32, or IR_CALL_C_FUNC) */
+    NativeType pending_intrinsic_elem_type;    /* Element type for dynamic array intrinsics */
+
+    /* QuickJS constant pool (not owned, valid during compile) */
+    JSValueConst *cpool;
+    int cpool_count;
+
+    /* Function currently being compiled + its closure var count
+     * (used to resolve nested native functions captured as closure vars) */
+    JSValueConst current_js_func;
+    int closure_var_count;
+
+    /* Compile-time string literals (owned, freed after each compile) */
+    char **compile_string_literals;
+    int compile_string_count;
+    int compile_string_capacity;
     
     /* Native C function registry */
      NativeFuncEntry native_funcs[NC_MAX_NATIVE_FUNCS];
@@ -344,8 +363,12 @@
      const NativeFuncSignature *sig
  );
  
- /* Look up a registered native function by name */
- NativeFuncEntry *native_lookup_function(NativeCompiler *nc, const char *name);
+/* Look up a registered native function by name */
+NativeFuncEntry *native_lookup_function(NativeCompiler *nc, const char *name);
+
+/* Register a compiled native function for nested calls (returns 0 on success) */
+int native_register_compiled_function(NativeCompiler *nc, void *code_ptr,
+                                      const NativeFuncSignature *sig);
  
  /* Compile a JavaScript function to native code */
  CompileResult native_compile_function(

@@ -61,7 +61,10 @@ static NativeType binary_result_type(NativeType left, NativeType right, IROp op)
     }
     
     /* Comparison operations always return bool */
-    if (op >= IR_EQ_I32 && op <= IR_LE_F32) {
+    if (op >= IR_EQ_I32 && op <= IR_GE_F32) {
+        return NATIVE_TYPE_BOOL;
+    }
+    if (op >= IR_EQ_I64 && op <= IR_GE_U64) {
         return NATIVE_TYPE_BOOL;
     }
     
@@ -395,8 +398,21 @@ static int infer_block_types(IRBasicBlock *block, NativeType *local_types,
             case IR_GT_U32:
             case IR_GE_U32:
             case IR_EQ_F32:
+            case IR_NE_F32:
             case IR_LT_F32:
-            case IR_LE_F32: {
+            case IR_LE_F32:
+            case IR_GT_F32:
+            case IR_GE_F32:
+            case IR_EQ_I64:
+            case IR_NE_I64:
+            case IR_LT_I64:
+            case IR_LE_I64:
+            case IR_GT_I64:
+            case IR_GE_I64:
+            case IR_LT_U64:
+            case IR_LE_U64:
+            case IR_GT_U64:
+            case IR_GE_U64: {
                 t2 = type_stack_pop(stack);
                 t1 = type_stack_pop(stack);
                 
@@ -406,9 +422,36 @@ static int infer_block_types(IRBasicBlock *block, NativeType *local_types,
                     if (instr->op == IR_EQ_I32) {
                         instr->op = IR_STRING_EQUALS;
                     } else {
-                        /* NE: Use STRING_EQUALS and negate later (or add IR_STRING_NE) */
-                        /* For now, keep as string compare */
-                        instr->op = IR_STRING_COMPARE;
+                        instr->op = IR_STRING_NE;
+                    }
+                } else if (NATIVE_TYPE_IS_FLOAT(t1) || NATIVE_TYPE_IS_FLOAT(t2)) {
+                    switch (instr->op) {
+                        case IR_EQ_I32: instr->op = IR_EQ_F32; break;
+                        case IR_NE_I32: instr->op = IR_NE_F32; break;
+                        case IR_LT_I32: instr->op = IR_LT_F32; break;
+                        case IR_LE_I32: instr->op = IR_LE_F32; break;
+                        case IR_GT_I32: instr->op = IR_GT_F32; break;
+                        case IR_GE_I32: instr->op = IR_GE_F32; break;
+                        default: break;
+                    }
+                } else if (NATIVE_TYPE_IS_INT64(t1) || NATIVE_TYPE_IS_INT64(t2)) {
+                    switch (instr->op) {
+                        case IR_EQ_I32: instr->op = IR_EQ_I64; break;
+                        case IR_NE_I32: instr->op = IR_NE_I64; break;
+                        case IR_LT_I32: instr->op = IR_LT_I64; break;
+                        case IR_LE_I32: instr->op = IR_LE_I64; break;
+                        case IR_GT_I32: instr->op = IR_GT_I64; break;
+                        case IR_GE_I32: instr->op = IR_GE_I64; break;
+                        default: break;
+                    }
+                } else if ((t1 == NATIVE_TYPE_UINT32 || t2 == NATIVE_TYPE_UINT32) &&
+                           instr->op >= IR_LT_I32 && instr->op <= IR_GE_I32) {
+                    switch (instr->op) {
+                        case IR_LT_I32: instr->op = IR_LT_U32; break;
+                        case IR_LE_I32: instr->op = IR_LE_U32; break;
+                        case IR_GT_I32: instr->op = IR_GT_U32; break;
+                        case IR_GE_I32: instr->op = IR_GE_U32; break;
+                        default: break;
                     }
                 }
                 
@@ -514,11 +557,18 @@ static int infer_block_types(IRBasicBlock *block, NativeType *local_types,
             }
             
             case IR_STRING_COMPARE:
-            case IR_STRING_EQUALS: {
+            case IR_STRING_EQUALS:
+            case IR_STRING_NE: {
                 t2 = type_stack_pop(stack);
                 t1 = type_stack_pop(stack);
                 type_stack_push(stack, NATIVE_TYPE_BOOL);
                 instr->type = NATIVE_TYPE_BOOL;
+                break;
+            }
+            
+            case IR_STRING_NEW: {
+                type_stack_push(stack, NATIVE_TYPE_STRING);
+                instr->type = NATIVE_TYPE_STRING;
                 break;
             }
             
@@ -561,11 +611,47 @@ static int infer_block_types(IRBasicBlock *block, NativeType *local_types,
             case IR_ARRAY_PUSH:
             case IR_ARRAY_RESIZE:
             case IR_ARRAY_RESERVE:
-            case IR_ARRAY_REMOVE: {
+            case IR_ARRAY_REMOVE:
+            case IR_ARRAY_INSERT: {
                 type_stack_pop(stack);  /* value or index */
                 type_stack_pop(stack);  /* array */
                 type_stack_push(stack, NATIVE_TYPE_BOOL);
                 instr->type = NATIVE_TYPE_BOOL;
+                break;
+            }
+
+            case IR_ARRAY_POP: {
+                type_stack_pop(stack);  /* array */
+                NativeType elem = instr->operand.field.field_type;
+                if (elem == NATIVE_TYPE_UNKNOWN)
+                    elem = NATIVE_TYPE_INT32;
+                type_stack_push(stack, elem);
+                instr->type = elem;
+                break;
+            }
+
+            case IR_ARRAY_GET: {
+                type_stack_pop(stack);  /* index */
+                type_stack_pop(stack);  /* array */
+                NativeType elem = instr->operand.field.field_type;
+                if (elem == NATIVE_TYPE_UNKNOWN)
+                    elem = NATIVE_TYPE_INT32;
+                type_stack_push(stack, elem);
+                instr->type = elem;
+                break;
+            }
+
+            case IR_ARRAY_SET: {
+                type_stack_pop(stack);  /* value */
+                type_stack_pop(stack);  /* index */
+                type_stack_pop(stack);  /* array */
+                instr->type = NATIVE_TYPE_VOID;
+                break;
+            }
+
+            case IR_ARRAY_NEW: {
+                type_stack_push(stack, NATIVE_TYPE_DYNAMIC_INT32_ARRAY);
+                instr->type = NATIVE_TYPE_DYNAMIC_INT32_ARRAY;
                 break;
             }
             
@@ -871,10 +957,13 @@ size_t native_type_alignment(NativeType type) {
 NativeType native_array_element_type(NativeType array_type) {
     switch (array_type) {
         case NATIVE_TYPE_INT32_ARRAY:
+        case NATIVE_TYPE_DYNAMIC_INT32_ARRAY:
             return NATIVE_TYPE_INT32;
         case NATIVE_TYPE_UINT32_ARRAY:
+        case NATIVE_TYPE_DYNAMIC_UINT32_ARRAY:
             return NATIVE_TYPE_UINT32;
         case NATIVE_TYPE_FLOAT32_ARRAY:
+        case NATIVE_TYPE_DYNAMIC_FLOAT32_ARRAY:
             return NATIVE_TYPE_FLOAT32;
         default:
             return NATIVE_TYPE_UNKNOWN;

@@ -13,6 +13,7 @@
 #include <ath_env.h>
 #include <athena/native_facade.h>
 #include "../native_compiler/native_compiler.h"
+#include "../native_compiler/native_array.h"
 
 #ifdef PS2
 #include <timer.h>
@@ -175,9 +176,13 @@ static JSValue js_native_compile(JSContext *ctx, JSValue this_val,
     /* Create a wrapper object to hold the native function */
     NativeFunc *func = (NativeFunc *)malloc(sizeof(NativeFunc));
     if (!func) {
+        native_func_free(&result.func);
         return JS_ThrowInternalError(ctx, "Failed to allocate native function");
     }
     *func = result.func;
+    
+    /* Register for nested compiled-to-compiled calls via constant pool */
+    native_register_compiled_function(compiler, func->code_ptr, &func->sig);
     
     /* Return the native function handle as an opaque pointer */
     JSValue handle = JS_NewUint32(ctx, (uint32_t)(uintptr_t)func);
@@ -1023,6 +1028,112 @@ static JSValue js_native_struct(JSContext *ctx, JSValue this_val,
 }
 
 /* Module function list */
+/* ============================================
+ * Dynamic array JS bindings
+ *
+ * Compiled functions that take a Dynamic{Int32,Uint32,Float32}Array argument
+ * expect a raw pointer to a NativeDynamicArray passed as an integer. These
+ * helpers let JS allocate such an array, read it back, and free it so the
+ * dynamic-array API can be exercised end to end.
+ * ============================================ */
+
+static NativeType dyn_array_type_from_name(const char *name) {
+    if (!name) return NATIVE_TYPE_UNKNOWN;
+    if (strcmp(name, "int") == 0 || strcmp(name, "int32") == 0)
+        return NATIVE_TYPE_INT32;
+    if (strcmp(name, "uint") == 0 || strcmp(name, "uint32") == 0)
+        return NATIVE_TYPE_UINT32;
+    if (strcmp(name, "float") == 0 || strcmp(name, "float32") == 0)
+        return NATIVE_TYPE_FLOAT32;
+    return NATIVE_TYPE_UNKNOWN;
+}
+
+/* Native.createDynamicArray(type, capacity=16) -> integer pointer handle */
+static JSValue js_native_create_dyn_array(JSContext *ctx, JSValue this_val,
+                                          int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1)
+        return JS_ThrowSyntaxError(ctx, "createDynamicArray requires a type");
+
+    const char *type_str = JS_ToCString(ctx, argv[0]);
+    if (!type_str)
+        return JS_EXCEPTION;
+
+    NativeType elem = dyn_array_type_from_name(type_str);
+    JS_FreeCString(ctx, type_str);
+    if (elem == NATIVE_TYPE_UNKNOWN)
+        return JS_ThrowTypeError(ctx, "Unsupported dynamic array type (use int/uint/float)");
+
+    uint32_t capacity = 16;
+    if (argc >= 2)
+        JS_ToUint32(ctx, &capacity, argv[1]);
+
+    NativeDynamicArray *arr = native_array_new(elem, capacity);
+    if (!arr)
+        return JS_ThrowOutOfMemory(ctx);
+
+    return JS_NewUint32(ctx, (uint32_t)(uintptr_t)arr);
+}
+
+static NativeDynamicArray *dyn_array_from_arg(JSContext *ctx, JSValueConst val) {
+    uint32_t handle;
+    if (JS_ToUint32(ctx, &handle, val) != 0)
+        return NULL;
+    return (NativeDynamicArray *)(uintptr_t)handle;
+}
+
+/* Native.dynArrayLength(ptr) -> int */
+static JSValue js_native_dyn_array_length(JSContext *ctx, JSValue this_val,
+                                          int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1)
+        return JS_ThrowSyntaxError(ctx, "dynArrayLength requires a pointer");
+    NativeDynamicArray *arr = dyn_array_from_arg(ctx, argv[0]);
+    if (!arr)
+        return JS_ThrowTypeError(ctx, "Invalid dynamic array pointer");
+    return JS_NewInt32(ctx, (int32_t)arr->length);
+}
+
+/* Native.dynArrayGet(ptr, index) -> number */
+static JSValue js_native_dyn_array_get(JSContext *ctx, JSValue this_val,
+                                       int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 2)
+        return JS_ThrowSyntaxError(ctx, "dynArrayGet requires (pointer, index)");
+    NativeDynamicArray *arr = dyn_array_from_arg(ctx, argv[0]);
+    if (!arr)
+        return JS_ThrowTypeError(ctx, "Invalid dynamic array pointer");
+    uint32_t index;
+    if (JS_ToUint32(ctx, &index, argv[1]) != 0)
+        return JS_EXCEPTION;
+    if (index >= arr->length)
+        return JS_ThrowRangeError(ctx, "Index %u out of bounds (length %u)",
+                                  index, (uint32_t)arr->length);
+
+    switch (arr->element_type) {
+        case NATIVE_TYPE_INT32:
+            return JS_NewInt32(ctx, ((int32_t *)arr->data)[index]);
+        case NATIVE_TYPE_UINT32:
+            return JS_NewUint32(ctx, ((uint32_t *)arr->data)[index]);
+        case NATIVE_TYPE_FLOAT32:
+            return JS_NewFloat64(ctx, (double)((float *)arr->data)[index]);
+        default:
+            return JS_ThrowTypeError(ctx, "Unsupported element type");
+    }
+}
+
+/* Native.dynArrayFree(ptr) -> void */
+static JSValue js_native_dyn_array_free(JSContext *ctx, JSValue this_val,
+                                        int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1)
+        return JS_ThrowSyntaxError(ctx, "dynArrayFree requires a pointer");
+    NativeDynamicArray *arr = dyn_array_from_arg(ctx, argv[0]);
+    if (arr)
+        native_array_free(arr);
+    return JS_UNDEFINED;
+}
+
 static const JSCFunctionListEntry module_funcs[] = {
     JS_CFUNC_DEF("compile", 2, js_native_compile),
     JS_CFUNC_DEF("isSupported", 0, js_native_is_supported),
@@ -1031,6 +1142,10 @@ static const JSCFunctionListEntry module_funcs[] = {
     JS_CFUNC_DEF("benchmark", 2, js_native_benchmark),
     JS_CFUNC_DEF("disassemble", 0, js_native_disassemble),
     JS_CFUNC_DEF("struct", 1, js_native_struct),
+    JS_CFUNC_DEF("createDynamicArray", 2, js_native_create_dyn_array),
+    JS_CFUNC_DEF("dynArrayLength", 1, js_native_dyn_array_length),
+    JS_CFUNC_DEF("dynArrayGet", 2, js_native_dyn_array_get),
+    JS_CFUNC_DEF("dynArrayFree", 1, js_native_dyn_array_free),
 };
 
 static int module_init(JSContext *ctx, JSModuleDef *m) {

@@ -54657,6 +54657,36 @@ int JS_GetFunctionBytecodeInfo(JSContext *ctx, JSValueConst func_val,
     info->arg_count = b->arg_count;
     info->var_count = b->var_count;
     info->stack_size = b->stack_size;
+    info->cpool = b->cpool;
+    info->cpool_count = b->cpool_count;
+    info->closure_var_count = b->closure_var_count;
     
     return 0;
+}
+
+JSValueConst JS_GetFunctionClosureVarValue(JSContext *ctx, JSValueConst func_val,
+                                           int idx)
+{
+    JSObject *p;
+    JSFunctionBytecode *b;
+    JSVarRef **var_refs;
+
+    (void)ctx;
+    if (JS_VALUE_GET_TAG(func_val) != JS_TAG_OBJECT)
+        return JS_UNDEFINED;
+    p = JS_VALUE_GET_OBJ(func_val);
+    if (!p)
+        return JS_UNDEFINED;
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION &&
+        p->class_id != JS_CLASS_GENERATOR_FUNCTION &&
+        p->class_id != JS_CLASS_ASYNC_FUNCTION &&
+        p->class_id != JS_CLASS_ASYNC_GENERATOR_FUNCTION)
+        return JS_UNDEFINED;
+    b = p->u.func.function_bytecode;
+    if (!b || idx < 0 || idx >= b->closure_var_count)
+        return JS_UNDEFINED;
+    var_refs = p->u.func.var_refs;
+    if (!var_refs || !var_refs[idx] || !var_refs[idx]->pvalue)
+        return JS_UNDEFINED;
+    return *var_refs[idx]->pvalue;
 }

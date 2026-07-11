@@ -26,6 +26,20 @@ extern JSClassID js_struct_class_id;
 /* Enable SHORT_OPCODES for the short versions of common opcodes */
 #define SHORT_OPCODES 1
 
+/* Debug trace layer for the compiler pipeline.
+ * Set NC_TRACE to 1 to get step-by-step logging of the pre-scan, the
+ * bytecode->IR decode loop, and the IR->MIPS emit loop. Each line is flushed
+ * immediately so the last line printed before a hang pinpoints the culprit. */
+#ifndef NC_TRACE
+#define NC_TRACE 1
+#endif
+
+#if NC_TRACE
+#define NC_LOG(...) do { printf("[NC] " __VA_ARGS__); printf("\n"); fflush(stdout); } while (0)
+#else
+#define NC_LOG(...) do {} while (0)
+#endif
+
 /* Define OP_FMT_* enum values first, like QuickJS does */
 enum {
     #define FMT(f) OP_FMT_ ## f,
@@ -354,7 +368,10 @@ typedef struct JSOpCode {
 static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
     #define FMT(f)
     #define DEF(id, size, n_pop, n_push, f) { size, n_pop, n_push, OP_FMT_ ## f },
-    #define def(id, size, n_pop, n_push, f)  /* def opcodes are not in main array */
+    /* Do NOT define `def` here: quickjs-opcode.h falls back to `def -> DEF`, which
+     * fills the trailing (temp/short opcode) region of the array with real sizes.
+     * short_opcode_info() indexes short opcodes (op >= OP_TEMP_START) into that
+     * region; leaving it zeroed makes their size 0 and hangs the decode loops. */
     #include "../quickjs/quickjs-opcode.h"
     #undef DEF
     #undef def
@@ -372,6 +389,318 @@ static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
 /* Helper function to get opcode info using short_opcode_info macro */
 static inline const JSOpCode *get_opcode_info(uint8_t op) {
     return &short_opcode_info(op);
+}
+
+/* ============================================
+ * Native Compiler Helpers
+ * ============================================ */
+
+static bool nc_is_dynamic_array(NativeType t) {
+    return t == NATIVE_TYPE_DYNAMIC_INT32_ARRAY ||
+           t == NATIVE_TYPE_DYNAMIC_UINT32_ARRAY ||
+           t == NATIVE_TYPE_DYNAMIC_FLOAT32_ARRAY;
+}
+
+static NativeType nc_dynamic_elem(NativeType t) {
+    switch (t) {
+        case NATIVE_TYPE_DYNAMIC_UINT32_ARRAY: return NATIVE_TYPE_UINT32;
+        case NATIVE_TYPE_DYNAMIC_FLOAT32_ARRAY: return NATIVE_TYPE_FLOAT32;
+        default: return NATIVE_TYPE_INT32;
+    }
+}
+
+static NativeType nc_get_local_type(const IRFunction *ir, int idx) {
+    if (ir && idx >= 0 && idx < ir->local_count)
+        return ir->local_types[idx];
+    return NATIVE_TYPE_UNKNOWN;
+}
+
+static NativeType nc_infer_array_elem_type(NativeCompiler *nc, const IRFunction *ir) {
+    if (nc->pending_intrinsic_elem_type != NATIVE_TYPE_UNKNOWN)
+        return nc->pending_intrinsic_elem_type;
+    if (nc->last_loaded_local >= 0) {
+        NativeType lt = nc_get_local_type(ir, nc->last_loaded_local);
+        if (nc_is_dynamic_array(lt))
+            return nc_dynamic_elem(lt);
+    }
+    for (int i = 0; ir && i < ir->sig.arg_count; i++) {
+        if (nc_is_dynamic_array(ir->sig.arg_types[i]))
+            return nc_dynamic_elem(ir->sig.arg_types[i]);
+    }
+    return NATIVE_TYPE_INT32;
+}
+
+static void nc_free_string_literals(NativeCompiler *nc) {
+    if (!nc) return;
+    for (int i = 0; i < nc->compile_string_count; i++)
+        free(nc->compile_string_literals[i]);
+    free(nc->compile_string_literals);
+    nc->compile_string_literals = NULL;
+    nc->compile_string_count = 0;
+    nc->compile_string_capacity = 0;
+}
+
+static int nc_add_string_literal(NativeCompiler *nc, const char *str) {
+    if (!nc || !str) return -1;
+    if (nc->compile_string_count >= nc->compile_string_capacity) {
+        int new_cap = nc->compile_string_capacity ? nc->compile_string_capacity * 2 : 8;
+        char **new_arr = (char **)realloc(nc->compile_string_literals,
+                                          sizeof(char *) * new_cap);
+        if (!new_arr) return -1;
+        nc->compile_string_literals = new_arr;
+        nc->compile_string_capacity = new_cap;
+    }
+    char *copy = strdup(str);
+    if (!copy) return -1;
+    int idx = nc->compile_string_count++;
+    nc->compile_string_literals[idx] = copy;
+    return idx;
+}
+
+static void nc_emit_string_new(NativeCompiler *nc, IRFunction *ir, int block, int lit_idx) {
+    IRInstr instr = { .op = IR_STRING_NEW, .type = NATIVE_TYPE_STRING };
+    instr.operand.i32 = lit_idx;
+    ir_emit(ir, block, &instr);
+}
+
+static void nc_emit_cpool_const(NativeCompiler *nc, IRFunction *ir, int block, int idx) {
+    if (nc->js_ctx && nc->cpool && idx >= 0 && idx < nc->cpool_count) {
+        JSValueConst val = nc->cpool[idx];
+        if (JS_IsString(val)) {
+            const char *s = JS_ToCString(nc->js_ctx, val);
+            if (s) {
+                int lit = nc_add_string_literal(nc, s);
+                JS_FreeCString(nc->js_ctx, s);
+                if (lit >= 0) {
+                    nc_emit_string_new(nc, ir, block, lit);
+                    return;
+                }
+            }
+        } else if (JS_IsNumber(val)) {
+            double d;
+            if (JS_ToFloat64(nc->js_ctx, &d, val) == 0) {
+                if (d == (double)(int32_t)d) {
+                    ir_emit_const_i32(ir, block, (int32_t)d);
+                } else {
+                    ir_emit_const_f32(ir, block, (float)d);
+                }
+                return;
+            }
+        }
+    }
+    ir_emit_const_i32(ir, block, 0);
+}
+
+static void *nc_resolve_cpool_func_ptr(NativeCompiler *nc, int cpool_idx) {
+    if (!nc->js_ctx || !nc->cpool || cpool_idx < 0 || cpool_idx >= nc->cpool_count)
+        return NULL;
+    JSValueConst val = nc->cpool[cpool_idx];
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
+        return NULL;
+    JSValue handle = JS_GetPropertyStr(nc->js_ctx, val, "_nativeHandle");
+    if (JS_IsException(handle) || JS_IsUndefined(handle)) {
+        JS_FreeValue(nc->js_ctx, handle);
+        return NULL;
+    }
+    uint32_t h;
+    if (JS_ToUint32(nc->js_ctx, &h, handle) != 0) {
+        JS_FreeValue(nc->js_ctx, handle);
+        return NULL;
+    }
+    JS_FreeValue(nc->js_ctx, handle);
+    NativeFunc *func = (NativeFunc *)(uintptr_t)h;
+    if (!func || !func->is_valid || !func->code_ptr)
+        return NULL;
+    return func->code_ptr;
+}
+
+static void *nc_resolve_closure_func_ptr(NativeCompiler *nc, int var_ref_idx) {
+    if (!nc->js_ctx || var_ref_idx < 0 || var_ref_idx >= nc->closure_var_count)
+        return NULL;
+    JSValueConst val = JS_GetFunctionClosureVarValue(nc->js_ctx, nc->current_js_func, var_ref_idx);
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
+        return NULL;
+    JSValue handle = JS_GetPropertyStr(nc->js_ctx, val, "_nativeHandle");
+    if (JS_IsException(handle) || JS_IsUndefined(handle)) {
+        JS_FreeValue(nc->js_ctx, handle);
+        return NULL;
+    }
+    uint32_t h;
+    if (JS_ToUint32(nc->js_ctx, &h, handle) != 0) {
+        JS_FreeValue(nc->js_ctx, handle);
+        return NULL;
+    }
+    JS_FreeValue(nc->js_ctx, handle);
+    NativeFunc *func = (NativeFunc *)(uintptr_t)h;
+    if (!func || !func->is_valid || !func->code_ptr)
+        return NULL;
+    return func->code_ptr;
+}
+
+static void nc_emit_func_ptr_const(NativeCompiler *nc, IRFunction *ir, int block, void *code_ptr) {
+    IRInstr instr = { .op = IR_CONST_I32, .type = NATIVE_TYPE_PTR };
+    instr.operand.i32 = (int32_t)(intptr_t)code_ptr;
+    ir_emit(ir, block, &instr);
+}
+
+static void *nc_array_push_fn(NativeType elem) {
+    switch (elem) {
+        case NATIVE_TYPE_UINT32: return (void *)native_array_push_u32;
+        case NATIVE_TYPE_FLOAT32: return (void *)native_array_push_f32_bits;
+        default: return (void *)native_array_push_i32;
+    }
+}
+
+static void *nc_array_pop_fn(NativeType elem) {
+    switch (elem) {
+        case NATIVE_TYPE_UINT32: return (void *)native_array_pop_u32;
+        case NATIVE_TYPE_FLOAT32: return (void *)native_array_pop_f32;
+        default: return (void *)native_array_pop_i32;
+    }
+}
+
+static void *nc_array_get_fn(NativeType elem) {
+    switch (elem) {
+        case NATIVE_TYPE_UINT32: return (void *)native_array_get_u32;
+        case NATIVE_TYPE_FLOAT32: return (void *)native_array_get_f32;
+        default: return (void *)native_array_get_i32;
+    }
+}
+
+static void *nc_array_set_fn(NativeType elem) {
+    switch (elem) {
+        case NATIVE_TYPE_UINT32: return (void *)native_array_set_u32;
+        case NATIVE_TYPE_FLOAT32: return (void *)native_array_set_f32;
+        default: return (void *)native_array_set_i32;
+    }
+}
+
+static void *nc_array_insert_fn(NativeType elem) {
+    (void)elem;
+    return (void *)native_array_insert_i32;
+}
+
+static bool nc_emit_array_string_intrinsic(NativeCompiler *nc, IRFunction *ir_out,
+                                           int current_block, IROp op, int nargs) {
+    NativeType elem = nc_infer_array_elem_type(nc, ir_out);
+    IRInstr instr = { .op = op, .type = NATIVE_TYPE_BOOL };
+    instr.operand.field.field_type = elem;
+
+    /* call_method / tail_call_method pass nargs = explicit JS args only.
+     * `this` is already on the IR stack from get_arg0 (or equivalent). */
+    switch (op) {
+        case IR_ARRAY_LENGTH:
+            if (nargs != 0) return false;
+            instr.type = NATIVE_TYPE_INT32;
+            break;
+        case IR_ARRAY_PUSH:
+            if (nargs != 1) return false;
+            break;
+        case IR_ARRAY_POP:
+            if (nargs != 0) return false;
+            instr.type = elem;
+            break;
+        case IR_ARRAY_CLEAR:
+            if (nargs != 0) return false;
+            instr.type = NATIVE_TYPE_VOID;
+            break;
+        case IR_ARRAY_RESIZE:
+        case IR_ARRAY_RESERVE:
+        case IR_ARRAY_REMOVE:
+            if (nargs != 1) return false;
+            break;
+        case IR_STRING_LENGTH:
+            if (nargs != 0) return false;
+            instr.type = NATIVE_TYPE_INT32;
+            break;
+        case IR_STRING_SLICE:
+            if (nargs != 2) return false;
+            instr.type = NATIVE_TYPE_STRING;
+            break;
+        case IR_STRING_FIND:
+            if (nargs != 1) return false;
+            instr.type = NATIVE_TYPE_INT32;
+            break;
+        case IR_STRING_TO_UPPER:
+        case IR_STRING_TO_LOWER:
+        case IR_STRING_TRIM:
+            if (nargs != 0) return false;
+            instr.type = NATIVE_TYPE_STRING;
+            break;
+        case IR_STRING_REPLACE:
+            if (nargs != 2) return false;
+            instr.type = NATIVE_TYPE_STRING;
+            break;
+        default:
+            return false;
+    }
+
+    ir_emit(ir_out, current_block, &instr);
+    return true;
+}
+
+static bool nc_match_array_string_method(NativeCompiler *nc, const IRFunction *ir,
+                                         const char *name) {
+    nc->pending_intrinsic_elem_type = NATIVE_TYPE_UNKNOWN;
+    if (strcmp(name, "push") == 0) {
+        nc->pending_intrinsic_op = IR_ARRAY_PUSH;
+        return true;
+    }
+    if (strcmp(name, "pop") == 0) {
+        nc->pending_intrinsic_op = IR_ARRAY_POP;
+        return true;
+    }
+    if (strcmp(name, "clear") == 0) {
+        nc->pending_intrinsic_op = IR_ARRAY_CLEAR;
+        return true;
+    }
+    if (strcmp(name, "resize") == 0) {
+        nc->pending_intrinsic_op = IR_ARRAY_RESIZE;
+        return true;
+    }
+    if (strcmp(name, "reserve") == 0) {
+        nc->pending_intrinsic_op = IR_ARRAY_RESERVE;
+        return true;
+    }
+    if (strcmp(name, "remove") == 0) {
+        nc->pending_intrinsic_op = IR_ARRAY_REMOVE;
+        return true;
+    }
+    if (strcmp(name, "slice") == 0) {
+        nc->pending_intrinsic_op = IR_STRING_SLICE;
+        return true;
+    }
+    if (strcmp(name, "indexOf") == 0) {
+        nc->pending_intrinsic_op = IR_STRING_FIND;
+        return true;
+    }
+    if (strcmp(name, "toUpperCase") == 0) {
+        nc->pending_intrinsic_op = IR_STRING_TO_UPPER;
+        return true;
+    }
+    if (strcmp(name, "toLowerCase") == 0) {
+        nc->pending_intrinsic_op = IR_STRING_TO_LOWER;
+        return true;
+    }
+    if (strcmp(name, "trim") == 0) {
+        nc->pending_intrinsic_op = IR_STRING_TRIM;
+        return true;
+    }
+    if (strcmp(name, "replace") == 0) {
+        nc->pending_intrinsic_op = IR_STRING_REPLACE;
+        return true;
+    }
+    if (strcmp(name, "length") == 0) {
+        NativeType lt = nc_get_local_type(ir, nc->last_loaded_local);
+        if (lt == NATIVE_TYPE_STRING)
+            nc->pending_intrinsic_op = IR_STRING_LENGTH;
+        else if (nc_is_dynamic_array(lt))
+            nc->pending_intrinsic_op = IR_ARRAY_LENGTH;
+        else
+            return false;
+        return true;
+    }
+    return false;
 }
 
 /* ============================================
@@ -415,6 +744,9 @@ void ir_func_free(IRFunction *ir) {
 
 int ir_create_block(IRFunction *ir) {
     if (!ir) return -1;
+    
+    if (ir->block_count >= NC_MAX_BASIC_BLOCKS)
+        return -1;
     
     if (ir->block_count >= ir->block_capacity) {
         int new_cap = ir->block_capacity * 2;
@@ -1165,6 +1497,7 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
     /* Initialize pending intrinsic state (IR_NOP is not 0, so explicit init needed) */
     nc->pending_intrinsic_op = IR_NOP;
     nc->pending_intrinsic_entry = NULL;
+    nc->pending_intrinsic_elem_type = NATIVE_TYPE_UNKNOWN;
     nc->last_put_field_target = -1;
     
     /* Note: local_struct_defs is populated by ath_native.c with per-argument struct defs
@@ -1192,10 +1525,12 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
         return -1;
     }
     
+    NC_LOG("prescan: begin bytecode_len=%zu map_size=%zu", bytecode_len, map_size);
     size_t scan_pc = 0;
     while (scan_pc < bytecode_len) {
         uint8_t op = bytecode[scan_pc++];
         int op_size = get_opcode_info(op)->size;
+        NC_LOG("prescan: pc=%zu op=%u size=%d", scan_pc - 1, op, op_size);
         
         if (op == OP_goto8 || op == OP_goto16 || op == OP_goto) {
             size_t target_pc;
@@ -1217,9 +1552,11 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 /* Find the start of the opcode that contains target_pc */
                 size_t opcode_start = target_pc;
                 if (target_pc > 0) {
-                    /* Search backwards to find the opcode that contains target_pc */
+                    /* Search backwards to find the opcode that contains target_pc.
+                     * NOTE: check_pc is size_t; iterate with a +1 bias so that
+                     * reaching 0 doesn't underflow into SIZE_MAX (infinite loop). */
                     size_t search_limit = (target_pc > 10) ? (target_pc - 10) : 0;
-                    for (size_t check_pc = target_pc - 1; check_pc >= search_limit; check_pc--) {
+                    for (size_t check_pc = target_pc; check_pc-- > search_limit; ) {
                         uint8_t check_op = bytecode[check_pc];
                         int check_size = get_opcode_info(check_op)->size;
                         if (check_pc + check_size > target_pc) {
@@ -1247,7 +1584,7 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 size_t opcode_start = target_pc;
                 if (target_pc > 0) {
                     size_t search_limit = (target_pc > 10) ? (target_pc - 10) : 0;
-                    for (size_t check_pc = target_pc - 1; check_pc >= search_limit; check_pc--) {
+                    for (size_t check_pc = target_pc; check_pc-- > search_limit; ) {
                         uint8_t check_op = bytecode[check_pc];
                         int check_size = get_opcode_info(check_op)->size;
                         if (check_pc + check_size > target_pc) {
@@ -1259,7 +1596,8 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 jump_targets[opcode_start] = 1;  /* FIX: Use full PC, not & 0xFF */
             }
         } else {
-            scan_pc += op_size - 1;
+            /* Guard: never let a bogus size-0 opcode move scan_pc backwards. */
+            scan_pc += (op_size > 1) ? (size_t)(op_size - 1) : 0;
         }
     }
     
@@ -1287,9 +1625,11 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
     /* Map PC 0 to the initial block */
     label_map[0] = current_block;
     
+    NC_LOG("decode: begin bytecode_len=%zu", bytecode_len);
     while (pc < bytecode_len) {
         uint8_t op = bytecode[pc++];
         int op_size = get_opcode_info(op)->size;
+        NC_LOG("decode: pc=%zu op=%u size=%d block=%d", pc - 1, op, op_size, current_block);
         
         /* Map current PC to current block (for future jumps to this location) */
         size_t current_pc = pc - 1;
@@ -2149,9 +2489,10 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 /* Find the start of the opcode that contains target_pc */
                 size_t opcode_start = target_pc;
                 if (target_pc < bytecode_len && target_pc > 0) {
-                    /* Search backwards to find the opcode that contains target_pc */
+                    /* Search backwards to find the opcode that contains target_pc.
+                     * Iterate with a +1 bias so reaching 0 doesn't underflow (infinite loop). */
                     size_t search_limit = (target_pc > 10) ? (target_pc - 10) : 0;
-                    for (size_t check_pc = target_pc - 1; check_pc >= search_limit; check_pc--) {
+                    for (size_t check_pc = target_pc; check_pc-- > search_limit; ) {
                         uint8_t check_op = bytecode[check_pc];
                         int check_size = get_opcode_info(check_op)->size;
                         if (check_pc + check_size > target_pc) {
@@ -2249,12 +2590,8 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
             
             /* get_length - used for array.length */
             case OP_get_length: {
-                /* For typed arrays, length is passed as a separate parameter.
-                 * This opcode pops object and pushes length.
-                 * We treat it as a no-op since the user provides length explicitly. */
-                /* Pop the array reference (not needed) */
-                /* Push a dummy value - will be replaced by actual length param */
-                ir_emit_const_i32(ir_out, current_block, 0);
+                IRInstr instr = { .op = IR_ARRAY_LENGTH, .type = NATIVE_TYPE_INT32 };
+                ir_emit(ir_out, current_block, &instr);
                 break;
             }
             #endif
@@ -2274,21 +2611,50 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
             
             /* Array access */
             case OP_get_array_el: {
-                IRInstr instr = { .op = IR_LOAD_ARRAY, .type = NATIVE_TYPE_UNKNOWN };
-                ir_emit(ir_out, current_block, &instr);
+                NativeType lt = nc_get_local_type(ir_out, nc->last_loaded_local);
+                if (nc_is_dynamic_array(lt)) {
+                    IRInstr instr = {
+                        .op = IR_ARRAY_GET,
+                        .type = nc_dynamic_elem(lt),
+                        .operand.field.field_type = nc_dynamic_elem(lt)
+                    };
+                    ir_emit(ir_out, current_block, &instr);
+                } else {
+                    IRInstr instr = { .op = IR_LOAD_ARRAY, .type = NATIVE_TYPE_UNKNOWN };
+                    ir_emit(ir_out, current_block, &instr);
+                }
                 break;
             }
             
             case OP_get_array_el2: {
-                /* Variant of get_array_el - same implementation */
-                IRInstr instr = { .op = IR_LOAD_ARRAY, .type = NATIVE_TYPE_UNKNOWN };
-                ir_emit(ir_out, current_block, &instr);
+                NativeType lt = nc_get_local_type(ir_out, nc->last_loaded_local);
+                if (nc_is_dynamic_array(lt)) {
+                    IRInstr instr = {
+                        .op = IR_ARRAY_GET,
+                        .type = nc_dynamic_elem(lt),
+                        .operand.field.field_type = nc_dynamic_elem(lt)
+                    };
+                    ir_emit(ir_out, current_block, &instr);
+                } else {
+                    IRInstr instr = { .op = IR_LOAD_ARRAY, .type = NATIVE_TYPE_UNKNOWN };
+                    ir_emit(ir_out, current_block, &instr);
+                }
                 break;
             }
             
             case OP_put_array_el: {
-                IRInstr instr = { .op = IR_STORE_ARRAY, .type = NATIVE_TYPE_VOID };
-                ir_emit(ir_out, current_block, &instr);
+                NativeType lt = nc_get_local_type(ir_out, nc->last_loaded_local);
+                if (nc_is_dynamic_array(lt)) {
+                    IRInstr instr = {
+                        .op = IR_ARRAY_SET,
+                        .type = NATIVE_TYPE_VOID,
+                        .operand.field.field_type = nc_dynamic_elem(lt)
+                    };
+                    ir_emit(ir_out, current_block, &instr);
+                } else {
+                    IRInstr instr = { .op = IR_STORE_ARRAY, .type = NATIVE_TYPE_VOID };
+                    ir_emit(ir_out, current_block, &instr);
+                }
                 break;
             }
             
@@ -2343,12 +2709,34 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
              * They should never appear in final bytecode as they are removed during compilation.
              * If we encounter them, handle in default case below. */
             
-            /* Push constant from constant pool - skip for now */
+            /* Push constant from constant pool */
             case OP_push_const: {
-                /* 4-byte constant pool index */
+                uint32_t idx = (uint32_t)(bytecode[pc] | (bytecode[pc+1] << 8) |
+                                          (bytecode[pc+2] << 16) | (bytecode[pc+3] << 24));
                 pc += 4;
-                /* Push a placeholder - in real impl would read from cpool */
-                ir_emit_const_i32(ir_out, current_block, 0);
+                nc_emit_cpool_const(nc, ir_out, current_block, (int)idx);
+                break;
+            }
+
+            /* Push atom string value (string literals) */
+            case OP_push_atom_value: {
+                uint32_t atom = (uint32_t)(bytecode[pc] | (bytecode[pc+1] << 8) |
+                                           (bytecode[pc+2] << 16) | (bytecode[pc+3] << 24));
+                pc += 4;
+                bool emitted = false;
+                if (nc->js_ctx) {
+                    const char *s = JS_AtomToCString(nc->js_ctx, (JSAtom)atom);
+                    if (s) {
+                        int lit = nc_add_string_literal(nc, s);
+                        JS_FreeCString(nc->js_ctx, s);
+                        if (lit >= 0) {
+                            nc_emit_string_new(nc, ir_out, current_block, lit);
+                            emitted = true;
+                        }
+                    }
+                }
+                if (!emitted)
+                    ir_emit_const_i32(ir_out, current_block, 0);
                 break;
             }
             
@@ -2375,10 +2763,36 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 ir_emit_const_i32(ir_out, current_block, 0);
                 break;
             
-            /* Closure - not supported */
+            /* Closure - resolve compiled native functions from constant pool */
             case OP_fclosure: {
-                pc += 4;  /* 4-byte index */
-                ir_emit_const_i32(ir_out, current_block, 0);
+                uint32_t idx = (uint32_t)(bytecode[pc] | (bytecode[pc+1] << 8) |
+                                          (bytecode[pc+2] << 16) | (bytecode[pc+3] << 24));
+                pc += 4;
+                void *code_ptr = nc_resolve_cpool_func_ptr(nc, (int)idx);
+                if (code_ptr)
+                    nc_emit_func_ptr_const(nc, ir_out, current_block, code_ptr);
+                else
+                    ir_emit_const_i32(ir_out, current_block, 0);
+                break;
+            }
+
+            /* Closure variable read: push the captured value. Used for nested
+             * native calls where the callee is captured from an outer scope.
+             * Operand is a 2-byte var_ref index. */
+            case OP_get_var_ref:
+            case OP_get_var_ref_check: {
+                uint16_t vidx = (uint16_t)(bytecode[pc] | (bytecode[pc+1] << 8));
+                pc += 2;
+                void *code_ptr = nc_resolve_closure_func_ptr(nc, (int)vidx);
+                if (code_ptr) {
+                    nc_emit_func_ptr_const(nc, ir_out, current_block, code_ptr);
+                } else {
+                    nc->has_error = true;
+                    snprintf(nc->error_msg, sizeof(nc->error_msg),
+                             "Closure variable %d is not a compiled native function "
+                             "(only nested Native.compile() calls are supported)", vidx);
+                    return -1;
+                }
                 break;
             }
             
@@ -2398,6 +2812,22 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 if (nc->js_ctx && nc->last_loaded_local >= 0 && nc->last_loaded_local < NC_MAX_LOCALS) {
                     const char *name = JS_AtomToCString(nc->js_ctx, (JSAtom)atom);
                     if (name) {
+                        if (strcmp(name, "length") == 0) {
+                            NativeType lt = nc_get_local_type(ir_out, nc->last_loaded_local);
+                            IRInstr drop = { .op = IR_DROP, .type = NATIVE_TYPE_VOID };
+                            ir_emit(ir_out, current_block, &drop);
+                            ir_emit_load_local(ir_out, current_block, nc->last_loaded_local, lt);
+                            if (lt == NATIVE_TYPE_STRING) {
+                                IRInstr len = { .op = IR_STRING_LENGTH, .type = NATIVE_TYPE_INT32 };
+                                ir_emit(ir_out, current_block, &len);
+                            } else if (nc_is_dynamic_array(lt)) {
+                                IRInstr len = { .op = IR_ARRAY_LENGTH, .type = NATIVE_TYPE_INT32 };
+                                ir_emit(ir_out, current_block, &len);
+                            } else {
+                                ir_emit_const_i32(ir_out, current_block, 0);
+                            }
+                            found_field = true;
+                        } else {
                         /* Get struct def for the last loaded local */
                         struct NativeStructDef *def = nc->local_struct_defs[nc->last_loaded_local];
                         if (def) {
@@ -2455,6 +2885,7 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                                 }
                             }
                         }
+                        }
                         JS_FreeCString(nc->js_ctx, name);
                     }
                 }
@@ -2479,6 +2910,7 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 /* Check if this is an intrinsic or registered C function */
                 nc->pending_intrinsic_op = IR_NOP;
                 nc->pending_intrinsic_entry = NULL;
+                nc->pending_intrinsic_elem_type = NATIVE_TYPE_UNKNOWN;
                 
                 if (nc->js_ctx) {
                     const char *name = JS_AtomToCString(nc->js_ctx, (JSAtom)atom);
@@ -2512,7 +2944,7 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                             nc->pending_intrinsic_op = IR_SMOOTHSTEP_F32;
                         } else if (strcmp(name, "inversesqrt") == 0 || strcmp(name, "rsqrt") == 0) {
                             nc->pending_intrinsic_op = IR_RSQRT_F32;
-                        } else {
+                        } else if (!nc_match_array_string_method(nc, ir_out, name)) {
                             /* Look up in native function registry */
                             char full_name[64];
                             snprintf(full_name, sizeof(full_name), "Math.%s", name);
@@ -2631,7 +3063,7 @@ found_base:
                 bool emitted_intrinsic = false;
                 
                 /* Check if we have a pending intrinsic from OP_get_field2 */
-                if (nc->pending_intrinsic_op != IR_NOP && nargs >= 1 && nargs <= 8) {
+                if (nc->pending_intrinsic_op != IR_NOP && nargs >= 0 && nargs <= 8) {
                     IROp intrinsic_op = nc->pending_intrinsic_op;
                     NativeFuncEntry *entry = nc->pending_intrinsic_entry;
                     
@@ -2712,10 +3144,15 @@ found_base:
                         ir_emit(ir_out, current_block, &instr);
                         emitted_intrinsic = true;
                     }
+                    else if (nc_emit_array_string_intrinsic(nc, ir_out, current_block,
+                                                            intrinsic_op, nargs)) {
+                        emitted_intrinsic = true;
+                    }
                     
                     /* Clear pending intrinsic */
                     nc->pending_intrinsic_op = IR_NOP;
                     nc->pending_intrinsic_entry = NULL;
+                    nc->pending_intrinsic_elem_type = NATIVE_TYPE_UNKNOWN;
                 }
                 
                 if (!emitted_intrinsic) {
@@ -2752,7 +3189,7 @@ found_base:
                 bool emitted_intrinsic = false;
                 
                 /* Check if we have a pending intrinsic from OP_get_field2 */
-                if (nc->pending_intrinsic_op != IR_NOP && nargs >= 1 && nargs <= 8) {
+                if (nc->pending_intrinsic_op != IR_NOP && nargs >= 0 && nargs <= 8) {
                     IROp intrinsic_op = nc->pending_intrinsic_op;
                     NativeFuncEntry *entry = nc->pending_intrinsic_entry;
                     
@@ -2833,13 +3270,21 @@ found_base:
                         ir_emit(ir_out, current_block, &instr);
                         emitted_intrinsic = true;
                     }
+                    else if (nc_emit_array_string_intrinsic(nc, ir_out, current_block,
+                                                            intrinsic_op, nargs)) {
+                        emitted_intrinsic = true;
+                    }
                     
                     /* Clear pending intrinsic */
                     nc->pending_intrinsic_op = IR_NOP;
                     nc->pending_intrinsic_entry = NULL;
+                    nc->pending_intrinsic_elem_type = NATIVE_TYPE_UNKNOWN;
                 }
                 
-                if (!emitted_intrinsic) {
+                if (emitted_intrinsic) {
+                    /* tail_call_method ends the function — return the intrinsic result */
+                    ir_emit_return(ir_out, current_block, ir_out->sig.return_type);
+                } else {
                     /* Generic tail call - emit IR_TAIL_CALL stub */
                     IRInstr call = { .op = IR_TAIL_CALL, .type = NATIVE_TYPE_FLOAT32 };
                     call.operand.call.func_ptr = NULL;
@@ -2909,22 +3354,31 @@ found_base:
             
             /* push_const8 - 1-byte constant pool index */
             case OP_push_const8: {
-                pc += 1;
-                ir_emit_const_i32(ir_out, current_block, 0);
+                uint8_t idx = bytecode[pc++];
+                nc_emit_cpool_const(nc, ir_out, current_block, idx);
                 break;
             }
             
             /* fclosure8 - 1-byte closure index */
             case OP_fclosure8: {
-                pc += 1;
-                ir_emit_const_i32(ir_out, current_block, 0);
+                uint8_t idx = bytecode[pc++];
+                void *code_ptr = nc_resolve_cpool_func_ptr(nc, idx);
+                if (code_ptr)
+                    nc_emit_func_ptr_const(nc, ir_out, current_block, code_ptr);
+                else
+                    ir_emit_const_i32(ir_out, current_block, 0);
                 break;
             }
             
-            /* push_empty_string - push empty string (as 0 for native) */
-            case OP_push_empty_string:
-                ir_emit_const_i32(ir_out, current_block, 0);
+            /* push_empty_string - create empty NativeString constant */
+            case OP_push_empty_string: {
+                int lit = nc_add_string_literal(nc, "");
+                if (lit >= 0)
+                    nc_emit_string_new(nc, ir_out, current_block, lit);
+                else
+                    ir_emit_const_i32(ir_out, current_block, 0);
                 break;
+            }
                 
             /* is_undefined, is_null - type checks */
             case OP_is_undefined:
@@ -2950,6 +3404,19 @@ found_base:
                     if (idx >= ir_out->local_count) ir_out->local_count = idx + 1;
                     break;
                 }
+                if (op >= OP_get_var_ref0 && op <= OP_get_var_ref3) {
+                    int vidx = op - OP_get_var_ref0;
+                    void *code_ptr = nc_resolve_closure_func_ptr(nc, vidx);
+                    if (code_ptr) {
+                        nc_emit_func_ptr_const(nc, ir_out, current_block, code_ptr);
+                        break;
+                    }
+                    nc->has_error = true;
+                    snprintf(nc->error_msg, sizeof(nc->error_msg),
+                             "Closure variable %d is not a compiled native function "
+                             "(only nested Native.compile() calls are supported)", vidx);
+                    return -1;
+                }
                 if (op >= OP_put_arg0 && op <= OP_put_arg3) {
                     int idx = op - OP_put_arg0;
                     ir_emit_store_local(ir_out, current_block, idx, NATIVE_TYPE_UNKNOWN);
@@ -2974,16 +3441,14 @@ found_base:
                     return -1;
                 }
                 
-                /* Unsupported opcode - skip it using size lookup */
-                int op_size = get_opcode_info(op)->size;
-                printf("WARNING: Unknown opcode 0x%02x (decimal %d) at pc=%zu/%zu. "
-                       "Skipping %d bytes.\n",
-                       op, op, pc - 1, bytecode_len, op_size);
-                printf("DEBUG: OP_get_field2=%d (0x%02x), OP_call_method=%d (0x%02x), OP_get_field=%d (0x%02x)\n",
-                       OP_get_field2, OP_get_field2, OP_call_method, OP_call_method, OP_get_field, OP_get_field);
-                /* Skip the opcode and its operands */
-                pc += op_size - 1;  /* -1 because we already incremented pc for the opcode */
-                break;
+                /* Unsupported opcode - fail compilation */
+                nc->has_error = true;
+                snprintf(nc->error_msg, sizeof(nc->error_msg),
+                         "Unsupported bytecode opcode 0x%02x [%s] at pc=%zu",
+                         op, op_to_cstr(op), pc - 1);
+                free(jump_targets);
+                free(label_map);
+                return -1;
             }
         }
     }
@@ -3039,6 +3504,8 @@ static bool detect_loops(const IRFunction *ir) {
  * - Local variables (if function has loops): use $s0-$s7 for int32 types
  * - Everything else: stack
  */
+static bool detect_leaf_function(const IRFunction *ir);
+
 static void allocate_locals(NativeCompiler *nc, const IRFunction *ir) {
     /* MipsEmitter *em = &nc->emitter; - Unused */
     
@@ -3051,40 +3518,46 @@ static void allocate_locals(NativeCompiler *nc, const IRFunction *ir) {
     /* Use argument registers for first 4 args */
     const MipsReg arg_regs[] = { REG_A0, REG_A1, REG_A2, REG_A3 };
     
-    /* Saved registers for loop counters */
-    const MipsReg saved_regs[] = { REG_S0, REG_S1, REG_S2, REG_S3, 
-                                    REG_S4, REG_S5, REG_S6, REG_S7 };
-    
     int stack_slot = 0;
-    int next_saved_reg = 0;  /* Index into saved_regs */
-    nc->used_saved_regs = 0;  /* Reset bitmask */
+    nc->used_saved_regs = 0;  /* Reset bitmask; eval stack marks $s0-$s7 later */
     
     /* Detect loops in function */
     nc->has_loops = detect_loops(ir);
+
+    /* Non-leaf functions call C runtime helpers / other native functions, which
+     * clobber the caller-saved argument registers $a0-$a3. If an argument is used
+     * after such a call, reading it back from $a0-$a3 would return garbage. Spill
+     * arguments to stack slots in that case so they have a stable home. The eval
+     * operand stack occupies $s0-$s7, so we can't home them there. */
+    bool spill_args = !detect_leaf_function(ir);
     
     /* Process all locals declared in IR */
     for (int i = 0; i < ir->local_count; i++) {
         if (i < 4 && i < ir->sig.arg_count) {
-            /* Use argument register for args 0-3 */
-            nc->local_regs[i] = (int)arg_regs[i];
-            nc->local_stack_offs[i] = -1;
+            if (spill_args) {
+                /* Spill arg to stack (prologue stores $a0-$a3 there).
+                 * Arguments arrive in registers, so each occupies at least one
+                 * 32-bit slot. Pointer-like types (string/array/ptr) report a
+                 * size of 0 from native_type_size, so clamp to 4 bytes to avoid
+                 * two args sharing the same stack offset. */
+                size_t size = native_type_size(ir->local_types[i]);
+                if (size < 4) size = 4;
+                nc->local_regs[i] = -1;
+                nc->local_stack_offs[i] = stack_slot;
+                stack_slot += (size + 3) & ~3;  /* Align to 4 bytes */
+            } else {
+                /* Leaf function: keep args in their registers */
+                nc->local_regs[i] = (int)arg_regs[i];
+                nc->local_stack_offs[i] = -1;
+            }
         } else if (i >= 4 && i < ir->sig.arg_count) {
             /* Stack-passed arguments (args 4+) - passed by caller above our frame.
              * Mark with sentinel -2 and calculate actual offset later in prologue
              * when frame_size is known. Offset will be: frame_size + (i-4)*4 */
             nc->local_regs[i] = -1;
             nc->local_stack_offs[i] = -2;  /* Sentinel: stack-passed arg */
-        } else if (nc->has_loops &&  /* Only use saved regs if function has loops */
-                   i >= ir->sig.arg_count &&  /* Not an argument */
-                   ir->local_types[i] == NATIVE_TYPE_INT32 &&  /* Int only for now */
-                   next_saved_reg < 8) {  /* Have registers available */
-            /* Allocate to saved register for loop counter */
-            nc->local_regs[i] = (int)saved_regs[next_saved_reg];
-            nc->local_stack_offs[i] = -1;
-            nc->used_saved_regs |= (1 << next_saved_reg);  /* Mark as used */
-            next_saved_reg++;
         } else {
-            /* Allocate on stack */
+            /* Allocate on stack ($s0-$s7 are reserved for the eval operand stack) */
             nc->local_regs[i] = -1;
             nc->local_stack_offs[i] = stack_slot;
             
@@ -3123,12 +3596,48 @@ static void allocate_locals(NativeCompiler *nc, const IRFunction *ir) {
  * Detect if function is a leaf (doesn't call other functions).
  * Leaf functions don't need to save/restore $ra.
  */
+/* True if an IR op lowers to a JALR into the C runtime (or another native
+ * function). Such ops clobber the caller-saved argument registers, so a
+ * function containing any of them is not a leaf. Note the inline ops
+ * (IR_ARRAY_GET/SET/LENGTH, IR_STRING_LENGTH) do NOT emit a call. */
+static bool ir_op_emits_call(IROp op) {
+    switch (op) {
+        case IR_CALL:
+        case IR_CALL_C_FUNC:
+        case IR_TAIL_CALL:
+        /* Dynamic array ops backed by the C runtime */
+        case IR_ARRAY_NEW:
+        case IR_ARRAY_PUSH:
+        case IR_ARRAY_POP:
+        case IR_ARRAY_INSERT:
+        case IR_ARRAY_REMOVE:
+        case IR_ARRAY_RESIZE:
+        case IR_ARRAY_RESERVE:
+        case IR_ARRAY_CLEAR:
+        /* String ops backed by the C runtime */
+        case IR_STRING_NEW:
+        case IR_STRING_CONCAT:
+        case IR_STRING_SLICE:
+        case IR_STRING_COMPARE:
+        case IR_STRING_EQUALS:
+        case IR_STRING_NE:
+        case IR_STRING_FIND:
+        case IR_STRING_REPLACE:
+        case IR_STRING_TO_UPPER:
+        case IR_STRING_TO_LOWER:
+        case IR_STRING_TRIM:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool detect_leaf_function(const IRFunction *ir) {
     for (int b = 0; b < ir->block_count; b++) {
         const IRBasicBlock *block = &ir->blocks[b];
         for (int i = 0; i < block->instr_count; i++) {
-            if (block->instrs[i].op == IR_CALL || block->instrs[i].op == IR_CALL_C_FUNC) {
-                return false;  /* Has a call - not a leaf */
+            if (ir_op_emits_call(block->instrs[i].op)) {
+                return false;  /* Has a runtime call - not a leaf */
             }
         }
     }
@@ -3173,7 +3682,7 @@ static void emit_function_prologue(NativeCompiler *nc, const NativeFuncSignature
     }
     
     /* Only save arguments if we need to move them somewhere else */
-    /* Note: We use temporary registers ($t0-$t7) which don't need to be preserved per n32 ABI */
+    /* Note: $t0-$t7 are scratch; eval stack uses callee-saved $s0-$s7 instead */
     if (need_temp_save) {
         for (int i = 0; i < sig->arg_count && i < 4; i++) {
             mips_move(em, temp_regs[i], arg_regs[i]);
@@ -3345,7 +3854,7 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
     /* Log all IR instructions */
     /* op_names removed to fix unused variable warning */
     
-    /* We use T0-T7 as an operand stack - stored in compiler context */
+    /* Eval operand stack: $s0-$s7 (callee-saved, preserved across C runtime calls) */
     if (nc->stack_top < 0) {
         nc->stack_top = 0;  /* Reset if needed */
     }
@@ -3353,7 +3862,7 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
         nc->stack_depth = 0;  /* Reset if needed */
     }
     
-    #define STACK_REG(n) (REG_T0 + (n))
+    #define STACK_REG(n) (REG_S0 + (n))
     #define PUSH_REG() (STACK_REG(nc->stack_top++))
     #define POP_REG() (STACK_REG(--nc->stack_top))
     #define PEEK_REG() (STACK_REG(nc->stack_top - 1))
@@ -3375,11 +3884,8 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
     #define POP_TYPE() ((nc->stack_depth > 0) ? nc->stack_types[--nc->stack_depth] : NATIVE_TYPE_UNKNOWN)
     #define PEEK_TYPE(n) ((nc->stack_depth > (n) && (n) >= 0) ? nc->stack_types[nc->stack_depth - 1 - (n)] : NATIVE_TYPE_UNKNOWN)
     
-    /* DEBUG: Log IR opcode being processed */
-    static int instr_count = 0;
-    if (instr_count < 10) {  /* Only first 10 instructions */
-        printf("[IR %d] op=%d\n", instr_count++, instr->op);
-    }
+    NC_LOG("emit: ir_op=%d type=%d stack_top=%d stack_depth=%d",
+           instr->op, instr->type, nc->stack_top, nc->stack_depth);
     
     switch (instr->op) {
         case IR_NOP:
@@ -3581,6 +4087,12 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             MipsReg base_reg = POP_REG();  /* Pop base second (was sp[-2]) */
             NativeType base_type = POP_TYPE();  /* Pop base type (array type) */
             
+            /* Dynamic arrays pass a NativeDynamicArray* struct; the element buffer
+             * is at arr->data (offset 0). Typed arrays pass the buffer directly. */
+            if (NATIVE_TYPE_IS_DYNAMIC_ARRAY(base_type)) {
+                mips_lw(em, base_reg, 0, base_reg);  /* base = arr->data */
+            }
+            
             /* Calculate offset: idx * 4 (assuming 32-bit elements) */
             mips_sll(em, REG_AT, idx_reg, 2);
             mips_addu(em, REG_AT, base_reg, REG_AT);
@@ -3719,6 +4231,12 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
                         mips_move(em, idx_reg, nc->local_regs[idx_local_idx]);
                     }
                 }
+            }
+            
+            /* Dynamic arrays pass a NativeDynamicArray* struct; the element buffer
+             * is at arr->data (offset 0). Typed arrays pass the buffer directly. */
+            if (NATIVE_TYPE_IS_DYNAMIC_ARRAY(base_type)) {
+                mips_lw(em, base_reg, 0, base_reg);  /* base = arr->data */
             }
             
             /* Calculate address: base + (idx * 4) */
@@ -3976,8 +4494,8 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             NativeType t1 = POP_TYPE();
             
             /* Save $ra on stack (4 bytes below current $sp) */
-            mips_addiu(em, REG_SP, REG_SP, -8);  /* Allocate stack space */
-            mips_sw(em, REG_RA, 4, REG_SP);      /* Save $ra */
+            mips_addiu(em, REG_SP, REG_SP, -8);
+            mips_sw(em, REG_RA, 4, REG_SP);
             
             /* Setup arguments */
             mips_move(em, REG_A0, r1);
@@ -4055,6 +4573,31 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
         /* ============================================
          * String Operations
          * ============================================ */
+
+        case IR_STRING_NEW: {
+            int lit_idx = instr->operand.i32;
+            if (lit_idx < 0 || lit_idx >= nc->compile_string_count ||
+                !nc->compile_string_literals) {
+                nc->has_error = true;
+                snprintf(nc->error_msg, sizeof(nc->error_msg),
+                         "Invalid string literal index %d", lit_idx);
+                return -1;
+            }
+            const char *lit = nc->compile_string_literals[lit_idx];
+            mips_addiu(em, REG_SP, REG_SP, -8);
+            mips_sw(em, REG_RA, 4, REG_SP);
+            mips_la(em, REG_A0, (void *)lit);
+            mips_lui(em, REG_T9, ((uint32_t)(uintptr_t)native_string_from_cstr >> 16) & 0xFFFF);
+            mips_ori(em, REG_T9, REG_T9, (uint32_t)(uintptr_t)native_string_from_cstr & 0xFFFF);
+            mips_jalr(em, REG_RA, REG_T9);
+            mips_nop(em);
+            mips_lw(em, REG_RA, 4, REG_SP);
+            mips_addiu(em, REG_SP, REG_SP, 8);
+            MipsReg dst = PUSH_REG();
+            mips_move(em, dst, REG_V0);
+            PUSH_TYPE(NATIVE_TYPE_STRING);
+            break;
+        }
         
         case IR_STRING_CONCAT: {
             /* Concatenate two strings: result = native_string_concat(a, b) */
@@ -4149,6 +4692,27 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             
             MipsReg dst = PUSH_REG();
             mips_move(em, dst, REG_V0);
+            PUSH_TYPE(NATIVE_TYPE_BOOL);
+            break;
+        }
+
+        case IR_STRING_NE: {
+            MipsReg r2 = POP_REG();
+            POP_TYPE();
+            MipsReg r1 = POP_REG();
+            POP_TYPE();
+            mips_addiu(em, REG_SP, REG_SP, -8);
+            mips_sw(em, REG_RA, 4, REG_SP);
+            mips_move(em, REG_A0, r1);
+            mips_move(em, REG_A1, r2);
+            mips_lui(em, REG_T9, ((uint32_t)(uintptr_t)native_string_equals >> 16) & 0xFFFF);
+            mips_ori(em, REG_T9, REG_T9, (uint32_t)(uintptr_t)native_string_equals & 0xFFFF);
+            mips_jalr(em, REG_RA, REG_T9);
+            mips_nop(em);
+            mips_lw(em, REG_RA, 4, REG_SP);
+            mips_addiu(em, REG_SP, REG_SP, 8);
+            MipsReg dst = PUSH_REG();
+            mips_xori(em, dst, REG_V0, 1);
             PUSH_TYPE(NATIVE_TYPE_BOOL);
             break;
         }
@@ -4279,9 +4843,57 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             break;
         }
 
+        case IR_STRING_REPLACE: {
+            MipsReg r3 = POP_REG();
+            POP_TYPE();
+            MipsReg r2 = POP_REG();
+            POP_TYPE();
+            MipsReg r1 = POP_REG();
+            POP_TYPE();
+            mips_addiu(em, REG_SP, REG_SP, -8);
+            mips_sw(em, REG_RA, 4, REG_SP);
+            mips_move(em, REG_A0, r1);
+            mips_move(em, REG_A1, r2);
+            mips_move(em, REG_A2, r3);
+            mips_lui(em, REG_T9, ((uint32_t)(uintptr_t)native_string_replace >> 16) & 0xFFFF);
+            mips_ori(em, REG_T9, REG_T9, (uint32_t)(uintptr_t)native_string_replace & 0xFFFF);
+            mips_jalr(em, REG_RA, REG_T9);
+            mips_nop(em);
+            mips_lw(em, REG_RA, 4, REG_SP);
+            mips_addiu(em, REG_SP, REG_SP, 8);
+            MipsReg dst = PUSH_REG();
+            mips_move(em, dst, REG_V0);
+            PUSH_TYPE(NATIVE_TYPE_STRING);
+            break;
+        }
+
         /* ============================================
          * Dynamic Array Operations
          * ============================================ */
+
+        case IR_ARRAY_NEW: {
+            NativeType elem = instr->operand.field.field_type;
+            int32_t cap = instr->operand.i32;
+            mips_addiu(em, REG_SP, REG_SP, -8);
+            mips_sw(em, REG_RA, 4, REG_SP);
+            mips_li(em, REG_A1, cap);
+            mips_li(em, REG_A0, (int32_t)elem);
+            mips_lui(em, REG_T9, ((uint32_t)(uintptr_t)native_array_new >> 16) & 0xFFFF);
+            mips_ori(em, REG_T9, REG_T9, (uint32_t)(uintptr_t)native_array_new & 0xFFFF);
+            mips_jalr(em, REG_RA, REG_T9);
+            mips_nop(em);
+            mips_lw(em, REG_RA, 4, REG_SP);
+            mips_addiu(em, REG_SP, REG_SP, 8);
+            MipsReg dst = PUSH_REG();
+            mips_move(em, dst, REG_V0);
+            if (elem == NATIVE_TYPE_UINT32)
+                PUSH_TYPE(NATIVE_TYPE_DYNAMIC_UINT32_ARRAY);
+            else if (elem == NATIVE_TYPE_FLOAT32)
+                PUSH_TYPE(NATIVE_TYPE_DYNAMIC_FLOAT32_ARRAY);
+            else
+                PUSH_TYPE(NATIVE_TYPE_DYNAMIC_INT32_ARRAY);
+            break;
+        }
         
         case IR_ARRAY_LENGTH: {
             /* Get array length - read length field from NativeDynamicArray struct */
@@ -4296,27 +4908,135 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
         }
         
         case IR_ARRAY_PUSH: {
-            /* Push element: native_array_push_i32(arr, value) */
+            /* Push element: native_array_push_*(arr, value) */
             MipsReg r2 = POP_REG();  /* value */
             NativeType t2 = POP_TYPE();
             MipsReg r1 = POP_REG();  /* arr */
             NativeType t1 = POP_TYPE();
+            NativeType elem = instr->operand.field.field_type;
+            void *push_fn = nc_array_push_fn(elem);
             
             mips_addiu(em, REG_SP, REG_SP, -8);
             mips_sw(em, REG_RA, 4, REG_SP);
             
             mips_move(em, REG_A0, r1);
-            mips_move(em, REG_A1, r2);
+            /* native_array_push_f32_bits takes the value as raw 32-bit float
+             * pattern in a GPR. If the source value is an integer, reinterpret
+             * it as a float (numeric convert) so the stored bits are correct. */
+            if (elem == NATIVE_TYPE_FLOAT32 &&
+                (t2 == NATIVE_TYPE_INT32 || t2 == NATIVE_TYPE_UINT32 || t2 == NATIVE_TYPE_BOOL)) {
+                MipsFpuReg fpu = mips_alloc_fpr(em);
+                mips_mtc1(em, r2, fpu);
+                mips_cvt_s_w(em, fpu, fpu);
+                mips_mfc1(em, REG_A1, fpu);
+                mips_free_fpr(em, fpu);
+            } else {
+                mips_move(em, REG_A1, r2);
+            }
             
-            /* Call appropriate push based on element type */
-            mips_lui(em, REG_T9, ((uint32_t)(uintptr_t)native_array_push_i32 >> 16) & 0xFFFF);
-            mips_ori(em, REG_T9, REG_T9, (uint32_t)(uintptr_t)native_array_push_i32 & 0xFFFF);
+            mips_lui(em, REG_T9, ((uint32_t)(uintptr_t)push_fn >> 16) & 0xFFFF);
+            mips_ori(em, REG_T9, REG_T9, (uint32_t)(uintptr_t)push_fn & 0xFFFF);
             mips_jalr(em, REG_RA, REG_T9);
             mips_nop(em);
             
             mips_lw(em, REG_RA, 4, REG_SP);
             mips_addiu(em, REG_SP, REG_SP, 8);
             
+            MipsReg dst = PUSH_REG();
+            mips_move(em, dst, REG_V0);
+            PUSH_TYPE(NATIVE_TYPE_BOOL);
+            break;
+        }
+
+        case IR_ARRAY_POP: {
+            MipsReg r1 = POP_REG();
+            NativeType t1 = POP_TYPE();
+            NativeType elem = instr->operand.field.field_type;
+            void *pop_fn = nc_array_pop_fn(elem);
+            mips_addiu(em, REG_SP, REG_SP, -12);
+            mips_sw(em, REG_RA, 8, REG_SP);
+            mips_addiu(em, REG_A1, REG_SP, 0);
+            mips_move(em, REG_A0, r1);
+            mips_lui(em, REG_T9, ((uint32_t)(uintptr_t)pop_fn >> 16) & 0xFFFF);
+            mips_ori(em, REG_T9, REG_T9, (uint32_t)(uintptr_t)pop_fn & 0xFFFF);
+            mips_jalr(em, REG_RA, REG_T9);
+            mips_nop(em);
+            mips_lw(em, REG_RA, 8, REG_SP);
+            mips_lw(em, REG_V0, 0, REG_SP);
+            mips_addiu(em, REG_SP, REG_SP, 12);
+            MipsReg dst = PUSH_REG();
+            mips_move(em, dst, REG_V0);
+            PUSH_TYPE(elem);
+            break;
+        }
+
+        case IR_ARRAY_GET: {
+            MipsReg idx = POP_REG();
+            POP_TYPE();
+            MipsReg arr = POP_REG();
+            POP_TYPE();
+            NativeType elem = instr->operand.field.field_type;
+            MipsReg data = PUSH_REG();
+            mips_lw(em, data, 0, arr);
+            mips_sll(em, REG_AT, idx, 2);
+            mips_addu(em, REG_AT, data, REG_AT);
+            MipsReg dst = PUSH_REG();
+            if (elem == NATIVE_TYPE_FLOAT32) {
+                MipsFpuReg f = mips_alloc_fpr(em);
+                mips_lwc1(em, f, 0, REG_AT);
+                mips_mfc1(em, dst, f);
+                mips_free_fpr(em, f);
+            } else {
+                mips_lw(em, dst, 0, REG_AT);
+            }
+            POP_REG();
+            PUSH_TYPE(elem);
+            break;
+        }
+
+        case IR_ARRAY_SET: {
+            MipsReg val = POP_REG();
+            POP_TYPE();
+            MipsReg idx = POP_REG();
+            POP_TYPE();
+            MipsReg arr = POP_REG();
+            POP_TYPE();
+            NativeType elem = instr->operand.field.field_type;
+            MipsReg data = PUSH_REG();
+            mips_lw(em, data, 0, arr);
+            mips_sll(em, REG_AT, idx, 2);
+            mips_addu(em, REG_AT, data, REG_AT);
+            if (elem == NATIVE_TYPE_FLOAT32) {
+                MipsFpuReg f = mips_alloc_fpr(em);
+                mips_mtc1(em, val, f);
+                mips_swc1(em, f, 0, REG_AT);
+                mips_free_fpr(em, f);
+            } else {
+                mips_sw(em, val, 0, REG_AT);
+            }
+            POP_REG();
+            break;
+        }
+
+        case IR_ARRAY_INSERT: {
+            MipsReg val = POP_REG();
+            POP_TYPE();
+            MipsReg idx = POP_REG();
+            POP_TYPE();
+            MipsReg arr = POP_REG();
+            POP_TYPE();
+            void *insert_fn = nc_array_insert_fn(instr->operand.field.field_type);
+            mips_addiu(em, REG_SP, REG_SP, -8);
+            mips_sw(em, REG_RA, 4, REG_SP);
+            mips_move(em, REG_A0, arr);
+            mips_move(em, REG_A1, idx);
+            mips_move(em, REG_A2, val);
+            mips_lui(em, REG_T9, ((uint32_t)(uintptr_t)insert_fn >> 16) & 0xFFFF);
+            mips_ori(em, REG_T9, REG_T9, (uint32_t)(uintptr_t)insert_fn & 0xFFFF);
+            mips_jalr(em, REG_RA, REG_T9);
+            mips_nop(em);
+            mips_lw(em, REG_RA, 4, REG_SP);
+            mips_addiu(em, REG_SP, REG_SP, 8);
             MipsReg dst = PUSH_REG();
             mips_move(em, dst, REG_V0);
             PUSH_TYPE(NATIVE_TYPE_BOOL);
@@ -5349,6 +6069,132 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             PUSH_TYPE(NATIVE_TYPE_INT32);
             break;
         }
+
+        case IR_LE_U32: {
+            MipsReg r2 = POP_REG();
+            POP_TYPE();
+            MipsReg r1 = POP_REG();
+            POP_TYPE();
+            MipsReg dst = PUSH_REG();
+            mips_sltu(em, REG_AT, r2, r1);
+            mips_xori(em, dst, REG_AT, 1);
+            PUSH_TYPE(NATIVE_TYPE_INT32);
+            break;
+        }
+
+        case IR_GT_U32: {
+            MipsReg r2 = POP_REG();
+            POP_TYPE();
+            MipsReg r1 = POP_REG();
+            POP_TYPE();
+            MipsReg dst = PUSH_REG();
+            mips_sltu(em, dst, r2, r1);
+            PUSH_TYPE(NATIVE_TYPE_INT32);
+            break;
+        }
+
+        case IR_GE_U32: {
+            MipsReg r2 = POP_REG();
+            POP_TYPE();
+            MipsReg r1 = POP_REG();
+            POP_TYPE();
+            MipsReg dst = PUSH_REG();
+            mips_sltu(em, REG_AT, r1, r2);
+            mips_xori(em, dst, REG_AT, 1);
+            PUSH_TYPE(NATIVE_TYPE_INT32);
+            break;
+        }
+
+        case IR_EQ_F32:
+        case IR_NE_F32:
+        case IR_LT_F32:
+        case IR_LE_F32:
+        case IR_GT_F32:
+        case IR_GE_F32: {
+            MipsReg r2 = POP_REG();
+            POP_TYPE();
+            MipsReg r1 = POP_REG();
+            POP_TYPE();
+            MipsFpuReg f0 = mips_alloc_fpr(em);
+            MipsFpuReg f1 = mips_alloc_fpr(em);
+            mips_mtc1(em, r1, f0);
+            mips_mtc1(em, r2, f1);
+            MipsReg dst = PUSH_REG();
+            int true_label = mips_label_create(em);
+            int end_label = mips_label_create(em);
+            if (instr->op == IR_EQ_F32) {
+                mips_c_eq_s(em, f0, f1);
+            } else if (instr->op == IR_LT_F32 || instr->op == IR_GT_F32) {
+                if (instr->op == IR_LT_F32)
+                    mips_c_lt_s(em, f0, f1);
+                else
+                    mips_c_lt_s(em, f1, f0);
+            } else if (instr->op == IR_LE_F32 || instr->op == IR_GE_F32) {
+                if (instr->op == IR_LE_F32)
+                    mips_c_le_s(em, f0, f1);
+                else
+                    mips_c_le_s(em, f1, f0);
+            } else {
+                mips_c_eq_s(em, f0, f1);
+            }
+            mips_nop(em);
+            mips_bc1t(em, true_label);
+            mips_nop(em);
+            mips_li(em, dst, (instr->op == IR_NE_F32) ? 1 : 0);
+            mips_beq(em, REG_ZERO, REG_ZERO, end_label);
+            mips_nop(em);
+            mips_label_bind(em, true_label);
+            mips_li(em, dst, (instr->op == IR_NE_F32) ? 0 : 1);
+            mips_label_bind(em, end_label);
+            mips_free_fpr(em, f1);
+            mips_free_fpr(em, f0);
+            PUSH_TYPE(NATIVE_TYPE_INT32);
+            break;
+        }
+
+        case IR_EQ_I64:
+        case IR_NE_I64:
+        case IR_LT_I64:
+        case IR_LE_I64:
+        case IR_GT_I64:
+        case IR_GE_I64:
+        case IR_LT_U64:
+        case IR_LE_U64:
+        case IR_GT_U64:
+        case IR_GE_U64: {
+            void *cmp_fn = NULL;
+            switch (instr->op) {
+                case IR_EQ_I64: cmp_fn = (void *)__deq_i64; break;
+                case IR_NE_I64: cmp_fn = (void *)__dne_i64; break;
+                case IR_LT_I64: cmp_fn = (void *)__dlt_i64; break;
+                case IR_LE_I64: cmp_fn = (void *)__dle_i64; break;
+                case IR_GT_I64: cmp_fn = (void *)__dgt_i64; break;
+                case IR_GE_I64: cmp_fn = (void *)__dge_i64; break;
+                case IR_LT_U64: cmp_fn = (void *)__dlt_u64; break;
+                case IR_LE_U64: cmp_fn = (void *)__dle_u64; break;
+                case IR_GT_U64: cmp_fn = (void *)__dgt_u64; break;
+                case IR_GE_U64: cmp_fn = (void *)__dge_u64; break;
+                default: break;
+            }
+            MipsReg r2 = POP_REG();
+            POP_TYPE();
+            MipsReg r1 = POP_REG();
+            POP_TYPE();
+            mips_addiu(em, REG_SP, REG_SP, -8);
+            mips_sw(em, REG_RA, 4, REG_SP);
+            mips_move(em, REG_A0, r1);
+            mips_move(em, REG_A1, r2);
+            mips_lui(em, REG_T9, ((uint32_t)(uintptr_t)cmp_fn >> 16) & 0xFFFF);
+            mips_ori(em, REG_T9, REG_T9, (uint32_t)(uintptr_t)cmp_fn & 0xFFFF);
+            mips_jalr(em, REG_RA, REG_T9);
+            mips_nop(em);
+            mips_lw(em, REG_RA, 4, REG_SP);
+            mips_addiu(em, REG_SP, REG_SP, 8);
+            MipsReg dst = PUSH_REG();
+            mips_move(em, dst, REG_V0);
+            PUSH_TYPE(NATIVE_TYPE_INT32);
+            break;
+        }
         
         /* Control flow */
         case IR_JUMP: {
@@ -5393,31 +6239,31 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
              */
             int nargs = instr->operand.call.arg_count;
             void *func_ptr = instr->operand.call.func_ptr;
-            
-            /* Pop function pointer (or use direct address) */
-            MipsReg target;
-            if (func_ptr != NULL) {
-                /* Direct call to known function */
-                target = PUSH_REG();
-                mips_la(em, target, func_ptr);
-            } else {
-                /* Indirect call - function pointer is on stack */
-                target = POP_REG();
-                POP_TYPE();
-            }
-            
-            /* Move arguments to $a0-$a3 (pop in reverse order) */
+
+            /* QuickJS stack layout for a call is [func_ptr, arg0, arg1, ...] with
+             * the last argument on top. Pop the arguments first, then the function
+             * pointer (which sits below them). */
             const MipsReg arg_regs[] = { REG_A0, REG_A1, REG_A2, REG_A3 };
             MipsReg arg_vals[4];
             int reg_args = (nargs < 4) ? nargs : 4;
-            
-            /* Pop args into temp storage */
+
             for (int i = reg_args - 1; i >= 0; i--) {
                 arg_vals[i] = POP_REG();
                 POP_TYPE();
             }
-            
-            /* Move to arg registers */
+
+            MipsReg target;
+            if (func_ptr != NULL) {
+                /* Direct call to known function - load into $t9 (temp) */
+                target = REG_T9;
+                mips_la(em, target, func_ptr);
+            } else {
+                /* Indirect call - function pointer is on stack, below the args */
+                target = POP_REG();
+                POP_TYPE();
+            }
+
+            /* Move to arg registers (sources are $s regs, dests are $a regs, no hazard) */
             for (int i = 0; i < reg_args; i++) {
                 if (arg_vals[i] != arg_regs[i]) {
                     mips_move(em, arg_regs[i], arg_vals[i]);
@@ -5452,26 +6298,30 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
              */
             int nargs = instr->operand.call.arg_count;
             void *func_ptr = instr->operand.call.func_ptr;
-            
-            /* Get function pointer */
-            MipsReg target;
-            if (func_ptr != NULL) {
-                target = PUSH_REG();
-                mips_la(em, target, func_ptr);
-            } else {
-                target = POP_REG();
-                POP_TYPE();
-            }
-            
-            /* Move arguments to $a0-$a3 */
+
+            /* QuickJS stack layout is [func_ptr, arg0, ...]; pop args first, then
+             * the function pointer below them. */
             const MipsReg arg_regs[] = { REG_A0, REG_A1, REG_A2, REG_A3 };
             MipsReg arg_vals[4];
             int reg_args = (nargs < 4) ? nargs : 4;
-            
+
             for (int i = reg_args - 1; i >= 0; i--) {
                 arg_vals[i] = POP_REG();
                 POP_TYPE();
             }
+
+            /* Resolve target into $t9. $t9 is a temp not restored by the epilogue,
+             * so it survives the $s0-$s7 restore below (an $s reg would be clobbered). */
+            if (func_ptr != NULL) {
+                mips_la(em, REG_T9, func_ptr);
+            } else {
+                MipsReg src = POP_REG();
+                POP_TYPE();
+                if (src != REG_T9) {
+                    mips_move(em, REG_T9, src);
+                }
+            }
+            MipsReg target = REG_T9;
             
             for (int i = 0; i < reg_args; i++) {
                 if (arg_vals[i] != arg_regs[i]) {
@@ -5492,6 +6342,15 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
                         offset -= 4;
                     }
                 }
+            }
+            
+            /* Restore $ra (the caller's return address) so the tail-called
+             * function returns directly to our caller. The prologue saved it at
+             * frame_size - 4 for non-leaf functions (any function with a call is
+             * non-leaf). Without this, the callee would return into the middle of
+             * this function and re-run the epilogue with a corrupted stack. */
+            if (!nc->is_leaf) {
+                mips_lw(em, REG_RA, frame_size - 4, REG_SP);
             }
             
             /* Restore $fp if needed */
@@ -5612,6 +6471,16 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
 int ir_to_native(NativeCompiler *nc, const IRFunction *ir) {
     if (!nc || !ir) return -1;
     
+    NC_LOG("ir_to_native: block_count=%d local_count=%d ret_type=%d",
+           ir->block_count, ir->local_count, ir->sig.return_type);
+    
+    if (ir->block_count > NC_MAX_BASIC_BLOCKS) {
+        nc->has_error = true;
+        snprintf(nc->error_msg, sizeof(nc->error_msg),
+                 "Too many basic blocks (%d, max %d)", ir->block_count, NC_MAX_BASIC_BLOCKS);
+        return -1;
+    }
+    
     MipsEmitter *em = &nc->emitter;
     
     /* Reset emitter for new function */
@@ -5627,6 +6496,10 @@ int ir_to_native(NativeCompiler *nc, const IRFunction *ir) {
     
     /* Allocate locals */
     allocate_locals(nc, ir);
+
+    /* $s0-$s7: eval operand stack (callee-saved, survive C runtime calls) */
+    nc->used_saved_regs |= 0xFF;
+    nc->needs_fp = true;
     
     /* Create labels for each basic block and map block index to label ID */
     int block_to_label[NC_MAX_BASIC_BLOCKS];
@@ -5685,6 +6558,7 @@ int ir_to_native(NativeCompiler *nc, const IRFunction *ir) {
         mips_label_bind(em, block_to_label[b]);
         
         IRBasicBlock *block = &ir->blocks[b];
+        NC_LOG("emit: block %d/%d instr_count=%d", b, ir->block_count, block->instr_count);
         
         /* Reset type stack when entering a branch target (conservative approach) */
         if (is_branch_target[b] && b > 0) {
@@ -5878,8 +6752,8 @@ int ir_to_native(NativeCompiler *nc, const IRFunction *ir) {
      * For functions with return types != void, the result should be in $v0.
      * The stack top holds the final computed value - move it to $v0. */
     if (ir->sig.return_type != NATIVE_TYPE_VOID && nc->stack_top > 0) {
-        /* Stack registers are $t0-$t7, indexed by stack_top */
-        MipsReg result_reg = (MipsReg)(REG_T0 + (nc->stack_top - 1));
+        /* Stack registers are $s0-$s7, indexed by stack_top */
+        MipsReg result_reg = (MipsReg)(REG_S0 + (nc->stack_top - 1));
         if (result_reg != REG_V0) {
             mips_move(em, REG_V0, result_reg);
         }
@@ -5996,14 +6870,14 @@ void native_compiler_free(NativeCompiler *nc) {
  * Extract bytecode from a QuickJS function.
  * Uses the official JS_GetFunctionBytecode API from quickjs.h
  */
-static int extract_js_bytecode(JSContext *ctx, JSValueConst js_func,
+static int extract_js_bytecode(NativeCompiler *nc, JSValueConst js_func,
                                 const uint8_t **out_bytecode, size_t *out_len,
                                 int *out_arg_count, int *out_var_count) {
     JSFunctionBytecodeInfo info;
     int ret;
     
     /* Use the QuickJS API to get bytecode info */
-    ret = JS_GetFunctionBytecodeInfo(ctx, js_func, &info);
+    ret = JS_GetFunctionBytecodeInfo(nc->js_ctx, js_func, &info);
     if (ret != 0) {
         return ret;
     }
@@ -6013,6 +6887,9 @@ static int extract_js_bytecode(JSContext *ctx, JSValueConst js_func,
     *out_len = info.bytecode_len;
     *out_arg_count = info.arg_count;
     *out_var_count = info.var_count;
+    nc->cpool = info.cpool;
+    nc->cpool_count = info.cpool_count;
+    nc->closure_var_count = info.closure_var_count;
     
     return 0;
 }
@@ -6029,6 +6906,11 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
     /* Reset compiler state */
     nc->has_error = false;
     nc->error_msg[0] = '\0';
+    nc_free_string_literals(nc);
+    nc->cpool = NULL;
+    nc->cpool_count = 0;
+    nc->current_js_func = js_func;
+    nc->closure_var_count = 0;
     ir_func_free(&nc->ir_func);
     
     /* Initialize IR function (this zeros the sig, but we'll set it below) */
@@ -6039,7 +6921,7 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
     size_t bytecode_len = 0;
     int js_arg_count = 0, js_var_count = 0;
     
-    int extract_result = extract_js_bytecode(nc->js_ctx, js_func, 
+    int extract_result = extract_js_bytecode(nc, js_func, 
                                               &bytecode, &bytecode_len,
                                               &js_arg_count, &js_var_count);
     
@@ -6069,7 +6951,9 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
     nc->js_var_count = js_var_count;
     
     /* Parse bytecode to IR */
+    NC_LOG("compile: START args=%d vars=%d bytecode_len=%zu", js_arg_count, js_var_count, bytecode_len);
     int parse_result = bytecode_to_ir(nc, bytecode, bytecode_len, &nc->ir_func);
+    NC_LOG("compile: bytecode_to_ir returned %d", parse_result);
     if (parse_result < 0) {
         /* If nc->error_msg was set, use it; otherwise create generic message */
         if (nc->error_msg[0] == '\0') {
@@ -6078,6 +6962,7 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
                      parse_result, bytecode_len, nc->ir_func.block_count);
         }
         result.error_msg = nc->error_msg;
+        nc_free_string_literals(nc);
         return result;
     }
     
@@ -6096,6 +6981,7 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
                  "Type inference failed (code=%d, blocks=%d, locals=%d)",
                  infer_result, nc->ir_func.block_count, nc->ir_func.local_count);
         result.error_msg = nc->error_msg;
+        nc_free_string_literals(nc);
         return result;
     }
     
@@ -6112,6 +6998,7 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
                  "Type validation failed (result=%d, blocks=%d, instrs=%d, args=%d, ret=%d)",
                  tc, nc->ir_func.block_count, total_instrs, sig->arg_count, sig->return_type);
         result.error_msg = nc->error_msg;
+        nc_free_string_literals(nc);
         return result;
     }
     
@@ -6134,8 +7021,10 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
     /* Generate native code */
     if (ir_to_native(nc, &nc->ir_func) < 0) {
         result.error_msg = nc->error_msg[0] ? nc->error_msg : "Code generation failed";
+        nc_free_string_literals(nc);
         return result;
     }
+    NC_LOG("compile: ir_to_native OK, code_size=%zu bytes", nc->emitter.buffer.count * 4);
     
     /* Run peephole optimizations */
     mips_emitter_peephole_optimize(&nc->emitter);
@@ -6143,6 +7032,7 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
     /* Finalize code (resolve labels, flush cache) */
     if (mips_emitter_finalize(&nc->emitter) < 0) {
         result.error_msg = nc->emitter.error_msg ? nc->emitter.error_msg : "Code finalization failed";
+        nc_free_string_literals(nc);
         return result;
     }
     
@@ -6156,6 +7046,7 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
     void *code_ptr = mips_emitter_get_code(&nc->emitter, &code_size);
     if (!code_ptr || code_size == 0) {
         result.error_msg = "No code generated";
+        nc_free_string_literals(nc);
         return result;
     }
     
@@ -6164,12 +7055,25 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
     result.func.code_size = code_size;
     result.func.sig = *sig;
     result.func.is_valid = true;
+    result.func.owned_literals = nc->compile_string_literals;
+    result.func.owned_literal_count = nc->compile_string_count;
+    nc->compile_string_literals = NULL;
+    nc->compile_string_count = 0;
+    nc->compile_string_capacity = 0;
     
     return result;
 }
 
 void native_func_free(NativeFunc *func) {
     if (!func) return;
+    
+    if (func->owned_literals) {
+        for (int i = 0; i < func->owned_literal_count; i++)
+            free(func->owned_literals[i]);
+        free(func->owned_literals);
+        func->owned_literals = NULL;
+        func->owned_literal_count = 0;
+    }
     
     /* Code is managed by emitter's arena buffer, don't free it */
     func->code_ptr = NULL;
@@ -6216,6 +7120,15 @@ NativeFuncEntry *native_lookup_function(NativeCompiler *nc, const char *name) {
         }
     }
     return NULL;
+}
+
+int native_register_compiled_function(NativeCompiler *nc, void *code_ptr,
+                                      const NativeFuncSignature *sig) {
+    (void)nc;
+    (void)code_ptr;
+    (void)sig;
+    /* Compiled functions are resolved via constant pool + _nativeHandle at compile time */
+    return 0;
 }
 
 /*
@@ -6272,7 +7185,20 @@ JSValue native_func_call(JSContext *ctx, NativeFunc *func, int argc, JSValueCons
             
             case NATIVE_TYPE_INT32_ARRAY:
             case NATIVE_TYPE_UINT32_ARRAY:
-            case NATIVE_TYPE_FLOAT32_ARRAY: {
+            case NATIVE_TYPE_FLOAT32_ARRAY:
+            case NATIVE_TYPE_DYNAMIC_INT32_ARRAY:
+            case NATIVE_TYPE_DYNAMIC_UINT32_ARRAY:
+            case NATIVE_TYPE_DYNAMIC_FLOAT32_ARRAY: {
+                /* Typed arrays pass buffer pointer; dynamic arrays pass NativeDynamicArray* */
+                if (NATIVE_TYPE_IS_DYNAMIC_ARRAY(sig->arg_types[i])) {
+                    int32_t ptr_val;
+                    if (JS_ToInt32(ctx, &ptr_val, argv[i]) == 0) {
+                        ptr_args[i] = (void *)(intptr_t)ptr_val;
+                    } else {
+                        return JS_ThrowTypeError(ctx, "Invalid dynamic array argument at index %d", i);
+                    }
+                    break;
+                }
                 size_t offset, length, elem_size;
                 JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[i], &offset, &length, &elem_size);
                 if (JS_IsException(buffer)) {
@@ -6333,8 +7259,8 @@ JSValue native_func_call(JSContext *ctx, NativeFunc *func, int argc, JSValueCons
      * - Return value in $v0/$v1
      * - Pointers are 32 bits (n32, not n64)
      * - Stack aligned to 16 bytes
-     * - Saved registers ($s0-$s7) must be preserved
-     * - Temporary registers ($t0-$t7) can be clobbered
+     * - Saved registers ($s0-$s7) preserved by callee
+     * - Temporary registers ($t0-$t9) are scratch (not preserved)
      */
     typedef int32_t (*native_func_8_t)(int32_t, int32_t, int32_t, int32_t, 
                                        int32_t, int32_t, int32_t, int32_t);
@@ -6345,7 +7271,9 @@ JSValue native_func_call(JSContext *ctx, NativeFunc *func, int argc, JSValueCons
     int32_t args[8] = {0};
     
     for (int i = 0; i < sig->arg_count && i < 8; i++) {
-        if (NATIVE_TYPE_IS_ARRAY(sig->arg_types[i]) || sig->arg_types[i] == NATIVE_TYPE_PTR ||
+        if (NATIVE_TYPE_IS_ARRAY(sig->arg_types[i]) ||
+            NATIVE_TYPE_IS_DYNAMIC_ARRAY(sig->arg_types[i]) ||
+            sig->arg_types[i] == NATIVE_TYPE_PTR ||
             sig->arg_types[i] == NATIVE_TYPE_STRING) {
             args[i] = (int32_t)(intptr_t)ptr_args[i];
         } else if (sig->arg_types[i] == NATIVE_TYPE_FLOAT32) {

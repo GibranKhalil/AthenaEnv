@@ -99,6 +99,8 @@ typedef struct NativeFunc {
     size_t code_size;             /* Size of generated code in bytes */
     NativeFuncSignature sig;      /* Function signature */
     bool is_valid;                /* Whether the function is valid */
+    char **owned_literals;        /* String literals referenced by generated code */
+    int owned_literal_count;
 } NativeFunc;
 
 /*

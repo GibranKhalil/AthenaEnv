@@ -982,4 +982,295 @@ console.log("\n=== Phase 1 Tests Completed ===");
 console.log("Implemented: Int64 emulation (mult/div/mod), String concatenation");
 console.log("Runtime: native_string_concat(), __dmult_i64(), __ddiv_i64(), __dmod_i64()");
 
+// ============================================
+// Phase 2: Extended String Operations
+// ============================================
+console.log("\n=== Phase 2: Extended String Operations ===");
+
+// String literals inside compiled code
+console.log("\n--- String Literals ---");
+const strLiteral = Native.compile({
+    args: [],
+    returns: 'string'
+}, () => "Hello" + " " + "Native");
+
+console.log(`Literal concat: "${strLiteral()}" (should be "Hello Native")`);
+
+const strEmptyLiteral = Native.compile({
+    args: [],
+    returns: 'string'
+}, () => "" + "empty");
+
+console.log(`Empty literal: "${strEmptyLiteral()}" (should be "empty")`);
+
+// String.length
+console.log("\n--- String.length ---");
+const strLength = Native.compile({
+    args: ['string'],
+    returns: 'int'
+}, (s) => s.length);
+
+console.log(`length("Hello") = ${strLength("Hello")} (should be 5)`);
+console.log(`length("") = ${strLength("")} (should be 0)`);
+console.log(`length("AthenaEnv") = ${strLength("AthenaEnv")} (should be 9)`);
+
+// String.slice
+console.log("\n--- String.slice ---");
+const strSlice = Native.compile({
+    args: ['string', 'int', 'int'],
+    returns: 'string'
+}, (s, start, end) => s.slice(start, end));
+
+console.log(`slice("Hello", 1, 4) = "${strSlice("Hello", 1, 4)}" (should be "ell")`);
+console.log(`slice("AthenaEnv", 0, 6) = "${strSlice("AthenaEnv", 0, 6)}" (should be "Athena")`);
+
+// String.indexOf
+console.log("\n--- String.indexOf ---");
+const strIndexOf = Native.compile({
+    args: ['string', 'string'],
+    returns: 'int'
+}, (s, needle) => s.indexOf(needle));
+
+console.log(`indexOf("Hello World", "World") = ${strIndexOf("Hello World", "World")} (should be 6)`);
+console.log(`indexOf("abcabc", "bc") = ${strIndexOf("abcabc", "bc")} (should be 1)`);
+console.log(`indexOf("abc", "z") = ${strIndexOf("abc", "z")} (should be -1)`);
+
+// String.toUpperCase / toLowerCase
+console.log("\n--- String Case Conversion ---");
+const strUpper = Native.compile({
+    args: ['string'],
+    returns: 'string'
+}, (s) => s.toUpperCase());
+
+const strLower = Native.compile({
+    args: ['string'],
+    returns: 'string'
+}, (s) => s.toLowerCase());
+
+console.log(`toUpperCase("Hello") = "${strUpper("Hello")}" (should be "HELLO")`);
+console.log(`toLowerCase("AthenaEnv") = "${strLower("AthenaEnv")}" (should be "athenaenv")`);
+
+// String.trim
+console.log("\n--- String.trim ---");
+const strTrim = Native.compile({
+    args: ['string'],
+    returns: 'string'
+}, (s) => s.trim());
+
+console.log(`trim("  hi  ") = "${strTrim("  hi  ")}" (should be "hi")`);
+
+// String.replace
+console.log("\n--- String.replace ---");
+const strReplace = Native.compile({
+    args: ['string', 'string', 'string'],
+    returns: 'string'
+}, (s, find, repl) => s.replace(find, repl));
+
+console.log(`replace("foo-bar-baz", "-", "_") = "${strReplace("foo-bar-baz", "-", "_")}" (should be "foo_bar-baz")`);
+
+// String equality / inequality
+console.log("\n--- String == / != ---");
+const strEquals = Native.compile({
+    args: ['string', 'string'],
+    returns: 'bool'
+}, (a, b) => a == b);
+
+const strNotEquals = Native.compile({
+    args: ['string', 'string'],
+    returns: 'bool'
+}, (a, b) => a != b);
+
+console.log(`"abc" == "abc" = ${strEquals("abc", "abc")} (should be true)`);
+console.log(`"abc" == "def" = ${strEquals("abc", "def")} (should be false)`);
+console.log(`"abc" != "def" = ${strNotEquals("abc", "def")} (should be true)`);
+console.log(`"abc" != "abc" = ${strNotEquals("abc", "abc")} (should be false)`);
+
+// ============================================
+// Phase 3: Comparison Correctness
+// ============================================
+console.log("\n=== Phase 3: Comparison Correctness ===");
+
+// Float comparisons (negative values — previously broken with integer SLT)
+console.log("\n--- Float Comparisons ---");
+const floatCompare = Native.compile({
+    args: ['float', 'float'],
+    returns: 'bool'
+}, (a, b) => a < b);
+
+const floatGreater = Native.compile({
+    args: ['float', 'float'],
+    returns: 'bool'
+}, (a, b) => a > b);
+
+const floatEquals = Native.compile({
+    args: ['float', 'float'],
+    returns: 'bool'
+}, (a, b) => a == b);
+
+console.log(`-2.0 < -1.0 = ${floatCompare(-2.0, -1.0)} (should be true)`);
+console.log(`-1.0 < -2.0 = ${floatCompare(-1.0, -2.0)} (should be false)`);
+console.log(`3.14 > 2.71 = ${floatGreater(3.14, 2.71)} (should be true)`);
+console.log(`1.0 == 1.0 = ${floatEquals(1.0, 1.0)} (should be true)`);
+
+// Unsigned comparisons (values above 0x7FFFFFFF)
+console.log("\n--- Unsigned Comparisons ---");
+const uintCompare = Native.compile({
+    args: ['uint', 'uint'],
+    returns: 'bool'
+}, (a, b) => a < b);
+
+const uintGreater = Native.compile({
+    args: ['uint', 'uint'],
+    returns: 'bool'
+}, (a, b) => a > b);
+
+const bigA = 0x80000001;  // 2147483649
+const bigB = 0x80000000;  // 2147483648
+const bigC = 0x80000002;  // 2147483650
+
+console.log(`0x80000001 < 0x80000002 = ${uintCompare(bigA, bigC)} (should be true)`);
+console.log(`0x80000001 > 0x80000000 = ${uintGreater(bigA, bigB)} (should be true)`);
+console.log(`0x80000000 < 0x80000001 = ${uintCompare(bigB, bigA)} (should be true)`);
+
+// Int64 comparisons
+console.log("\n--- Int64 Comparisons ---");
+const int64Less = Native.compile({
+    args: ['int64', 'int64'],
+    returns: 'bool'
+}, (a, b) => a < b);
+
+const int64Equals = Native.compile({
+    args: ['int64', 'int64'],
+    returns: 'bool'
+}, (a, b) => a == b);
+
+const int64Greater = Native.compile({
+    args: ['int64', 'int64'],
+    returns: 'bool'
+}, (a, b) => a > b);
+
+console.log(`100 < 200 = ${int64Less(100, 200)} (should be true)`);
+console.log(`500 == 500 = ${int64Equals(500, 500)} (should be true)`);
+console.log(`1000 > 999 = ${int64Greater(1000, 999)} (should be true)`);
+console.log(`-100 < 50 = ${int64Less(-100, 50)} (should be true)`);
+
+// Bool return type
+console.log("\n--- Bool Return Type ---");
+const isEven = Native.compile({
+    args: ['int'],
+    returns: 'bool'
+}, (n) => (n % 2) == 0);
+
+console.log(`isEven(4) = ${isEven(4)} (should be true)`);
+console.log(`isEven(7) = ${isEven(7)} (should be false)`);
+
+// ============================================
+// Phase 4: Nested Native Calls
+// ============================================
+console.log("\n=== Phase 4: Nested Native Calls ===");
+
+const nativeDouble = Native.compile({
+    args: ['int'],
+    returns: 'int'
+}, (x) => x * 2);
+
+const nativeQuadruple = Native.compile({
+    args: ['int'],
+    returns: 'int'
+}, (x) => nativeDouble(nativeDouble(x)));
+
+const nativeAddTen = Native.compile({
+    args: ['int'],
+    returns: 'int'
+}, (x) => x + 10);
+
+const nativeDoublePlusTen = Native.compile({
+    args: ['int'],
+    returns: 'int'
+}, (x) => nativeAddTen(nativeDouble(x)));
+
+console.log(`quadruple(5) = ${nativeQuadruple(5)} (should be 20)`);
+console.log(`quadruple(0) = ${nativeQuadruple(0)} (should be 0)`);
+console.log(`doublePlusTen(3) = ${nativeDoublePlusTen(3)} (should be 16)`);
+
+// Nested float helper
+const nativeSqrtHalf = Native.compile({
+    args: ['float'],
+    returns: 'float'
+}, (x) => Math.sqrt(x) * 0.5);
+
+const nativeHypotHalf = Native.compile({
+    args: ['float', 'float'],
+    returns: 'float'
+}, (a, b) => nativeSqrtHalf(a * a + b * b));
+
+console.log(`hypotHalf(3, 4) = ${nativeHypotHalf(3.0, 4.0).toFixed(4)} (should be 2.5)`);
+
+// ============================================
+// Phase 5: Dynamic Array API (pointer arg)
+// ============================================
+console.log("\n=== Phase 5: Dynamic Array API ===");
+console.log("Dynamic arrays use DynamicInt32Array/Uint32Array/Float32Array pointer args.");
+console.log("Pass a NativeDynamicArray* as an integer pointer when a JS constructor is available.");
+
+// Compile helpers — run when a valid array pointer is provided
+const dynArrayPushAndLen = Native.compile({
+    args: ['DynamicInt32Array', 'int'],
+    returns: 'int'
+}, (arr, val) => {
+    arr.push(val);
+    return arr.length;
+});
+
+const dynArrayGetSet = Native.compile({
+    args: ['DynamicInt32Array', 'int', 'int'],
+    returns: 'int'
+}, (arr, idx, val) => {
+    arr[idx] = val;
+    return arr[idx];
+});
+
+const dynArrayPop = Native.compile({
+    args: ['DynamicInt32Array'],
+    returns: 'int'
+}, (arr) => {
+    return arr.pop();
+});
+
+const dynFloatPush = Native.compile({
+    args: ['DynamicFloat32Array', 'float'],
+    returns: 'int'
+}, (arr, val) => {
+    arr.push(val);
+    return arr.length;
+});
+
+console.log("Compiled: dynArrayPushAndLen, dynArrayGetSet, dynArrayPop, dynFloatPush");
+
+// Runtime test using the host-provided dynamic array API
+const intArr = Native.createDynamicArray('int', 8);
+console.log(`push 10 -> length ${dynArrayPushAndLen(intArr, 10)} (should be 1)`);
+console.log(`push 20 -> length ${dynArrayPushAndLen(intArr, 20)} (should be 2)`);
+console.log(`push 30 -> length ${dynArrayPushAndLen(intArr, 30)} (should be 3)`);
+console.log(`getSet [1]=99 -> ${dynArrayGetSet(intArr, 1, 99)} (should be 99)`);
+console.log(`element [1] readback = ${Native.dynArrayGet(intArr, 1)} (should be 99)`);
+console.log(`pop -> ${dynArrayPop(intArr)} (should be 30)`);
+console.log(`length after pop = ${Native.dynArrayLength(intArr)} (should be 2)`);
+Native.dynArrayFree(intArr);
+
+const floatArr = Native.createDynamicArray('float', 4);
+console.log(`float push 1.5 -> length ${dynFloatPush(floatArr, 1.5)} (should be 1)`);
+console.log(`float push 2.5 -> length ${dynFloatPush(floatArr, 2.5)} (should be 2)`);
+console.log(`float element [0] = ${Native.dynArrayGet(floatArr, 0)} (should be 1.5)`);
+Native.dynArrayFree(floatArr);
+
+// ============================================
+// Summary
+// ============================================
+console.log("\n=== All Native Compiler Tests Completed ===");
+console.log("Phase 2: String literals, methods, ==/!=");
+console.log("Phase 3: Float/uint/int64 comparisons, bool");
+console.log("Phase 4: Nested Native.compile() calls");
+console.log("Phase 5: Dynamic array API (compile-only until JS constructor exists)");
+
 System.sleep(9999999999);

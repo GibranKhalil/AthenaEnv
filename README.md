@@ -259,9 +259,10 @@ console.log(add(5, 3)); // 8 - runs at native speed!
 ```
 
 **Supported type names:**
-* **Integers**: `'int'`, `'uint'`, `'int64'`, `'uint64'`
+* **Integers**: `'int'`, `'uint'`, `'int64'`, `'uint64'`, `'bool'`
 * **Floats**: `'float'` (single precision)
 * **Arrays**: `'Int32Array'`, `'Float32Array'`, `'Uint32Array'`
+* **Dynamic arrays**: `'DynamicInt32Array'`, `'DynamicUint32Array'`, `'DynamicFloat32Array'` (pass as pointer)
 * **Strings**: `'string'`
 * **Pointers**: `'ptr'`
 * **Structs**: Use your struct name (e.g., `'Vec3'`)
@@ -291,18 +292,21 @@ console.log(add(5, 3)); // 8 - runs at native speed!
     * `Math.smoothstep(e0, e1, x)` - Smooth interpolation (3rd order Hermite)
     * `Math.rsqrt(x)` - Reciprocal square root: `1/sqrt(x)`
 * ✅ **String operations:**
-  * String concatenation: `str1 + str2`
+  * String literals and concatenation: `"hello" + str`
   * String comparison: `==`, `!=`
+  * String methods: `.length`, `.slice()`, `.indexOf()`, `.toUpperCase()`, `.toLowerCase()`, `.trim()`, `.replace()`
   * String passed as arguments and returned
 * ✅ Typed array access: `array[i]`, `array[i] = value`
+* ✅ Dynamic array methods (when passed as `Dynamic*Array` / pointer): `.push()`, `.pop()`, `.length`, `.clear()`, `.resize()`, `.reserve()`, `.remove()`, indexing
+* ✅ Calling other `Native.compile()` functions from compiled code (nested native calls)
 * ✅ Struct field access: `obj.x`, `obj.position[0]`
 * ✅ Local variables and function parameters
 
 **What's NOT supported:**
-* ❌ Closures and capturing outer variables
-* ❌ Calling JavaScript functions (only Math.* intrinsics and native functions)
+* ❌ Closures and capturing outer variables (except references to other compiled native functions)
+* ❌ Calling arbitrary JavaScript functions (only `Math.*` intrinsics, array/string methods, and other `Native.compile()` functions)
 * ❌ Dynamic typing (all types must be declared)
-* ❌ Object/array creation inside native code (use passed arguments)
+* ❌ Creating dynamic arrays/strings inside native code without passing them as arguments (use literals for strings)
 * ❌ Exceptions (try/catch)
 * ❌ Regular expressions
 
