@@ -317,8 +317,7 @@ int main(int argc, char **argv) {
 
     } while (err_msg != NULL);
 #else
-    extern int athena_capp_main(int argc, char **argv);
-    athena_capp_main(argc, argv);
+    athena_run_app_main(argc, argv);
 #endif
 
 	// End program.

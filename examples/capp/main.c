@@ -308,7 +308,7 @@ static int capp_headless_main(void) {
     return 0;
 }
 
-int athena_capp_main(int argc, char **argv) {
+static int capp_app_main(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
@@ -318,3 +318,5 @@ int athena_capp_main(int argc, char **argv) {
     return capp_headless_main();
 #endif
 }
+
+ATHENA_APP_ENTRY(capp_app_main);
