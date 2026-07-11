@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include <kernel.h>
+#include <tamtypes.h>
 
 #include <gsKit.h>
 #include <dmaKit.h>

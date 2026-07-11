@@ -12,6 +12,9 @@
 #include <render_async_loader.h>
 #include <stdio.h>
 #include <ath_env.h>
+#include <athena/image.h>
+#include <ath_bindings.h>
+#include <athena/render_facade.h>
 #include <kernel.h>
 
 static JSClassID js_render_data_class_id;
@@ -23,15 +26,14 @@ static JSValue g_scene_node_ctor = JS_UNDEFINED;
 static JSValue g_async_loader_ctor = JS_UNDEFINED;
 
 typedef struct {
-	athena_render_data m;
-	JSValue *textures;
-	JSValue vertex_buffers[4];
-	bool owns_vertices[4];
+    AthenaRenderData native;
+    JSValue *textures;
+    JSValue vertex_buffers[4];
 } JSRenderData;
 
 typedef struct {
-    athena_batch *batch;
-    JSValue *refs; // keep JS RenderObject alive
+    AthenaRenderBatch *native;
+    JSValue *refs;
     uint32_t ref_count;
     uint32_t ref_capacity;
 } JSRenderBatch;
@@ -51,7 +53,7 @@ typedef struct {
 } JSSceneNode;
 
 typedef struct {
-    athena_async_loader *native;              // cooperative single-thread
+    AthenaAsyncLoader *native;
     uint32_t jobs_per_step;
 } JSRenderAsyncLoader;
 
@@ -62,6 +64,8 @@ typedef struct LoaderThunk {
 } LoaderThunk;
 
 static JSValue js_wrap_render_data(JSContext *ctx, athena_render_data *m);
+
+#define js_ro_data(ro) (athena_render_object_native((ro)->native))
 
 // Single-threaded bridge: builds JS objects and frees the thunk here.
 static void loader_bridge_cb(athena_render_data *data, void *user) {
@@ -186,65 +190,23 @@ static void js_value_list_remove(JSContext *ctx, JSValueList *list, JSValue valu
 	list->count--;
 }
 
-static void athena_render_data_dtor(JSRuntime *rt, JSValue val){
+static void js_render_data_finalizer(JSRuntime *rt, JSValue val){
 	JSRenderData* ro = JS_GetOpaque(val, js_render_data_class_id);
 
 	if (!ro)
 		return;
 
-	if (ro->m.indices)
-		free(ro->m.indices); 
-
-	VECTOR **attribute_ptrs[] = {
-		&ro->m.positions,
-		&ro->m.normals,
-		&ro->m.texcoords,
-		&ro->m.colours
-	};
-
 	for (int i = 0; i < 4; i++) {
-		if (*attribute_ptrs[i] && ro->owns_vertices[i]) {
-			free(*attribute_ptrs[i]);
-		}
-
-		if (!JS_IsUndefined(ro->vertex_buffers[i])) {
+		if (!JS_IsUndefined(ro->vertex_buffers[i]))
 			JS_FreeValueRT(rt, ro->vertex_buffers[i]);
-		}
-	}
-	
-	if (ro->m.materials)
-		free(ro->m.materials);
-	
-	if (ro->m.material_indices)
-		free(ro->m.material_indices);
-
-	if (ro->m.skin_data)
-		free(ro->m.skin_data);
-
-	if (ro->m.skeleton) {
-		if (ro->m.skeleton->bones)
-			free(ro->m.skeleton->bones);
-
-		free(ro->m.skeleton);
 	}
 
-	//printf("%d textures\n", ro->m.texture_count);
-
-	//for (int i = 0; i < ro->m.texture_count; i++) {
-	//	if (!((JSImageData*)JS_GetOpaque(ro->textures[i], get_img_class_id()))->path) {
-	//		printf("Freeing %d from mesh\n", i);
-	//		JS_FreeValueRT(rt, ro->textures[i]);
-	//	}
-	//}
-
-	if (ro->m.textures)
-		free(ro->m.textures);
+	athena_render_data_destroy(&ro->native);
 
 	if (ro->textures)
 		free(ro->textures);
 
 	js_free_rt(rt, ro);
-
 	JS_SetOpaque(val, NULL);
 }
 
@@ -256,7 +218,7 @@ static const char* vert_attributes[] = {
 };
 
 static JSValue athena_render_data_ctor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
-	JSImageData *image;
+	AthenaImage *image;
 	JSValue obj = JS_UNDEFINED;
     JSValue proto;
 
@@ -267,7 +229,7 @@ static JSValue athena_render_data_ctor(JSContext *ctx, JSValueConst new_target, 
 
 	for (int i = 0; i < 4; i++) {
 		ro->vertex_buffers[i] = JS_UNDEFINED;
-		ro->owns_vertices[i] = true;
+		ro->native.owns_vertices[i] = true;
 	}
 
 	if (JS_IsObject(argv[0])) {
@@ -277,10 +239,10 @@ static JSValue athena_render_data_ctor(JSContext *ctx, JSValueConst new_target, 
 		bool share_buffers = false;
 		
 		VECTOR** attributes_ptr[] = {
-			&ro->m.positions,
-			&ro->m.normals,
-			&ro->m.texcoords,
-			&ro->m.colours
+			&ro->native.m.positions,
+			&ro->native.m.normals,
+			&ro->native.m.texcoords,
+			&ro->native.m.colours
 		};
 
 		JSValue share_prop = JS_GetPropertyStr(ctx, argv[0], "shareBuffers");
@@ -318,16 +280,16 @@ static JSValue athena_render_data_ctor(JSContext *ctx, JSValueConst new_target, 
 
 			if (buffer_ptr && data_size) {
 				if (!i)
-					ro->m.index_count = data_size/sizeof(VECTOR);
+					ro->native.m.index_count = data_size/sizeof(VECTOR);
 
 				if (share_buffers && !JS_IsUndefined(data_ref)) {
 					*attributes_ptr[i] = (VECTOR*)buffer_ptr;
-					ro->owns_vertices[i] = false;
+					ro->native.owns_vertices[i] = false;
 					ro->vertex_buffers[i] = JS_DupValue(ctx, data_ref);
 				} else {
 					*attributes_ptr[i] = malloc(data_size);
 					memcpy(*attributes_ptr[i], buffer_ptr, data_size);
-					ro->owns_vertices[i] = true;
+					ro->native.owns_vertices[i] = true;
 				}
 			}
 
@@ -337,34 +299,34 @@ static JSValue athena_render_data_ctor(JSContext *ctx, JSValueConst new_target, 
 			JS_FreeValue(ctx, vert_arr);
 		}
 		
-		ro->m.materials = (ath_mat *)malloc(sizeof(ath_mat));
-		ro->m.material_count = 1;
+		ro->native.m.materials = (ath_mat *)malloc(sizeof(ath_mat));
+		ro->native.m.material_count = 1;
 
-		ro->m.material_indices = (material_index *)malloc(sizeof(material_index));
-		ro->m.material_index_count = 1;
+		ro->native.m.material_indices = (material_index *)malloc(sizeof(material_index));
+		ro->native.m.material_index_count = 1;
 
-		init_vector(ro->m.materials[0].ambient);
-		init_vector(ro->m.materials[0].diffuse);
-		init_vector(ro->m.materials[0].specular);
-		init_vector(ro->m.materials[0].emission);
-		init_vector(ro->m.materials[0].transmittance);
-		init_vector(ro->m.materials[0].transmission_filter);
+		init_vector(ro->native.m.materials[0].ambient);
+		init_vector(ro->native.m.materials[0].diffuse);
+		init_vector(ro->native.m.materials[0].specular);
+		init_vector(ro->native.m.materials[0].emission);
+		init_vector(ro->native.m.materials[0].transmittance);
+		init_vector(ro->native.m.materials[0].transmission_filter);
 
-		ro->m.attributes.has_decal = false;
-		ro->m.attributes.has_refmap = false;
-		ro->m.attributes.has_bumpmap = false;
+		ro->native.m.attributes.has_decal = false;
+		ro->native.m.attributes.has_refmap = false;
+		ro->native.m.attributes.has_bumpmap = false;
 
-		ro->m.materials[0].shininess = 1.0f;
-		ro->m.materials[0].refraction = 1.0f;
-		ro->m.materials[0].disolve = 1.0f;
+		ro->native.m.materials[0].shininess = 1.0f;
+		ro->native.m.materials[0].refraction = 1.0f;
+		ro->native.m.materials[0].disolve = 1.0f;
 
-		ro->m.materials[0].texture_id = -1;
-    	ro->m.materials[0].bump_texture_id = -1;  
-		ro->m.materials[0].decal_texture_id = -1;  
-    	ro->m.materials[0].ref_texture_id = -1; 
+		ro->native.m.materials[0].texture_id = -1;
+    	ro->native.m.materials[0].bump_texture_id = -1;  
+		ro->native.m.materials[0].decal_texture_id = -1;  
+    	ro->native.m.materials[0].ref_texture_id = -1; 
 
-		ro->m.material_indices[0].index = 0;
-		ro->m.material_indices[0].end = ro->m.index_count;
+		ro->native.m.material_indices[0].index = 0;
+		ro->native.m.material_indices[0].end = ro->native.m.index_count;
 
 		if(argc > 1) {
 			JS_DupValue(ctx, argv[1]);
@@ -372,22 +334,22 @@ static JSValue athena_render_data_ctor(JSContext *ctx, JSValueConst new_target, 
 
 			image->tex->Filter = GS_FILTER_LINEAR;
 
-			ro->m.textures = malloc(sizeof(GSSURFACE*));
+			ro->native.m.textures = malloc(sizeof(GSSURFACE*));
 			ro->textures = malloc(sizeof(JSValue));
 
-			ro->m.textures[0] = image->tex;
-			ro->m.texture_count = 1;
+			ro->native.m.textures[0] = image->tex;
+			ro->native.m.texture_count = 1;
 
-			ro->m.materials[0].texture_id = image->tex;
+			ro->native.m.materials[0].texture_id = image->tex;
 
 			ro->textures[0] = argv[1];
 		}
 
-		ro->m.tristrip = false;
+		ro->native.m.tristrip = false;
 		if (argc > 2) 
-			ro->m.tristrip = JS_ToBool(ctx, argv[2]);
+			ro->native.m.tristrip = JS_ToBool(ctx, argv[2]);
 	
-		ro->m.pipeline = PL_DEFAULT;
+		ro->native.m.pipeline = PL_DEFAULT;
 
 		goto register_3d_render_data;
 	}
@@ -404,34 +366,20 @@ static JSValue athena_render_data_ctor(JSContext *ctx, JSValueConst new_target, 
 
 		image->tex->Filter = GS_FILTER_LINEAR;
 
-		loadModel(&ro->m, file_tbo, image->tex);
+		loadModel(&ro->native.m, file_tbo, image->tex);
 
 	} else if (argc > 0) {
-		loadModel(&ro->m, file_tbo, NULL);
+		loadModel(&ro->native.m, file_tbo, NULL);
 
-		ro->textures = malloc(sizeof(JSValue)*ro->m.texture_count);
+		ro->textures = malloc(sizeof(JSValue)*ro->native.m.texture_count);
 
-		for (int i = 0; i < ro->m.texture_count; i++) {
-			JSImageData* image;
+		for (int i = 0; i < ro->native.m.texture_count; i++) {
+			AthenaImage* image;
     		JSValue img_obj = JS_UNDEFINED;
 
-			image = js_mallocz(ctx, sizeof(*image));
+			image = athena_image_wrap(ro->native.m.textures[i], true);
     		if (!image)
     		    return JS_EXCEPTION;
-
-			image->delayed = true;
-			image->tex = ro->m.textures[i];
-
-			image->loaded = true;
-			image->width = image->tex->Width;
-			image->height = image->tex->Height;
-			image->endx = image->tex->Width;
-			image->endy = image->tex->Height;
-
-			image->startx = 0.0f;
-			image->starty = 0.0f;
-			image->angle = 0.0f;
-			image->color = 0x80808080;
 
     		img_obj = JS_NewObjectClass(ctx, get_img_class_id());    
     		JS_SetOpaque(img_obj, image);
@@ -446,45 +394,45 @@ register_3d_render_data:
     proto = JS_GetPropertyStr(ctx, new_target, "prototype");
     obj = JS_NewObjectProtoClass(ctx, proto, js_render_data_class_id);
 
-	ro->m.attributes.accurate_clipping = 1;
-	ro->m.attributes.face_culling = CULL_FACE_BACK;
-	ro->m.attributes.texture_mapping = 1;
-	ro->m.attributes.shade_model = 1;
+	ro->native.m.attributes.accurate_clipping = 1;
+	ro->native.m.attributes.face_culling = CULL_FACE_BACK;
+	ro->native.m.attributes.texture_mapping = 1;
+	ro->native.m.attributes.shade_model = 1;
 
 	FlushCache(WRITEBACK_DCACHE);
 
-	if (ro->m.skin_data) {
+	if (ro->native.m.skin_data) {
 		JSValue bones = JS_NewArray(ctx);
 
 		// TODO: create a class for bones so they can be passed by reference
-		for (int i = 0; i < ro->m.skeleton->bone_count; i++) {
+		for (int i = 0; i < ro->native.m.skeleton->bone_count; i++) {
 			JSValue bone = JS_NewObject(ctx);
 
-			JS_DefinePropertyValueStr(ctx, bone, "name",      JS_NewString(ctx, ro->m.skeleton->bones[i].name), JS_PROP_C_W_E);
-			JS_DefinePropertyValueStr(ctx, bone, "parent_id", JS_NewInt32(ctx, ro->m.skeleton->bones[i].parent_id), JS_PROP_C_W_E);
+			JS_DefinePropertyValueStr(ctx, bone, "name",      JS_NewString(ctx, ro->native.m.skeleton->bones[i].name), JS_PROP_C_W_E);
+			JS_DefinePropertyValueStr(ctx, bone, "parent_id", JS_NewInt32(ctx, ro->native.m.skeleton->bones[i].parent_id), JS_PROP_C_W_E);
 
     		JSValue bone_matrix = JS_NewObjectClass(ctx, get_matrix4_class_id());
 
-    		JS_SetOpaque(bone_matrix, &ro->m.skeleton->bones[i].inverse_bind);
+    		JS_SetOpaque(bone_matrix, &ro->native.m.skeleton->bones[i].inverse_bind);
 
 			JS_DefinePropertyValueStr(ctx, bone, "inverse_bind", bone_matrix, JS_PROP_C_W_E);
 
 
 			JSValue bone_position = JS_NewObjectClass(ctx, get_vector4_class_id());
 
-			JS_SetOpaque(bone_position, &ro->m.skeleton->bones[i].position);
+			JS_SetOpaque(bone_position, &ro->native.m.skeleton->bones[i].position);
 
 			JS_DefinePropertyValueStr(ctx, bone, "position", bone_position, JS_PROP_C_W_E);
 
 			JSValue bone_rotation = JS_NewObjectClass(ctx, get_vector4_class_id());
 
-			JS_SetOpaque(bone_rotation, &ro->m.skeleton->bones[i].rotation);
+			JS_SetOpaque(bone_rotation, &ro->native.m.skeleton->bones[i].rotation);
 
 			JS_DefinePropertyValueStr(ctx, bone, "rotation", bone_rotation, JS_PROP_C_W_E);
 
 			JSValue bone_scale = JS_NewObjectClass(ctx, get_vector4_class_id());
 
-			JS_SetOpaque(bone_scale, &ro->m.skeleton->bones[i].scale);
+			JS_SetOpaque(bone_scale, &ro->native.m.skeleton->bones[i].scale);
 
 			JS_DefinePropertyValueStr(ctx, bone, "scale", bone_scale, JS_PROP_C_W_E);
 
@@ -494,10 +442,10 @@ register_3d_render_data:
 		JS_DefinePropertyValueStr(ctx, obj, "bones", bones, JS_PROP_C_W_E);
 	}
 
-	if (ro->m.texture_count > 0) {
+	if (ro->native.m.texture_count > 0) {
 		JSValue tex_arr = JS_NewArray(ctx);
-		for (int i = 0; i < ro->m.texture_count; i++) {
-			if (((JSImageData*)JS_GetOpaque(ro->textures[i], get_img_class_id()))->path)
+		for (int i = 0; i < ro->native.m.texture_count; i++) {
+			if (((AthenaImage*)JS_GetOpaque(ro->textures[i], get_img_class_id()))->path)
 				JS_DupValue(ctx, ro->textures[i]);
 			JS_DefinePropertyValueUint32(ctx, tex_arr, i, ro->textures[i], JS_PROP_C_W_E);
 		}
@@ -512,11 +460,11 @@ register_3d_render_data:
 
 static JSClassDef js_render_data_class = {
     "RenderData",
-    .finalizer = athena_render_data_dtor,
+    .finalizer = js_render_data_finalizer,
 }; 
 
-static JSValue athena_rdfree(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv){
-	athena_render_data_dtor(JS_GetRuntime(ctx), this_val);
+static JSValue js_rdfree(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv){
+	js_render_data_finalizer(JS_GetRuntime(ctx), this_val);
 
 	return JS_UNDEFINED;
 }
@@ -527,7 +475,7 @@ static JSValue athena_getpipeline(JSContext *ctx, JSValueConst this_val, int mag
     if (!ro)
         return JS_EXCEPTION;
 
-	return JS_NewUint32(ctx, ro->m.pipeline);
+	return JS_NewUint32(ctx, ro->native.m.pipeline);
 }
 
 static JSValue athena_setpipeline(JSContext *ctx, JSValueConst this_val, JSValue val, int magic) {
@@ -539,7 +487,7 @@ static JSValue athena_setpipeline(JSContext *ctx, JSValueConst this_val, JSValue
 
 	JS_ToUint32(ctx, &pipeline, val);
 
-	ro->m.pipeline = pipeline;
+	ro->native.m.pipeline = pipeline;
 
 	return JS_UNDEFINED;
 }
@@ -550,27 +498,27 @@ static JSValue athena_settexture(JSContext *ctx, JSValue this_val, int argc, JSV
 
 	JS_ToUint32(ctx, &tex_idx, argv[0]);
 
-	if (ro->m.texture_count < (tex_idx+1)) {
-		ro->m.textures = realloc(ro->m.textures, sizeof(GSSURFACE*)*(ro->m.texture_count+1));
-		ro->textures =   realloc(ro->textures,   sizeof(JSValue)*(ro->m.texture_count+1));
-		ro->m.textures[tex_idx] = NULL;
+	if (ro->native.m.texture_count < (tex_idx+1)) {
+		ro->native.m.textures = realloc(ro->native.m.textures, sizeof(GSSURFACE*)*(ro->native.m.texture_count+1));
+		ro->textures =   realloc(ro->textures,   sizeof(JSValue)*(ro->native.m.texture_count+1));
+		ro->native.m.textures[tex_idx] = NULL;
 	}
 
-	if (ro->m.textures[tex_idx]) {
+	if (ro->native.m.textures[tex_idx]) {
 		//JS_FreeValue(ctx, ro->textures[tex_idx]);
 	}
 
 	JS_DupValue(ctx, argv[1]);
-	JSImageData* image = JS_GetOpaque2(ctx, argv[1], get_img_class_id());
+	AthenaImage* image = JS_GetOpaque2(ctx, argv[1], get_img_class_id());
 
 	ro->textures[tex_idx] = argv[1];
-	ro->m.textures[tex_idx] = image->tex;
+	ro->native.m.textures[tex_idx] = image->tex;
 
 	JSValue tex_arr = JS_GetPropertyStr(ctx, this_val, "textures");
 	JS_DefinePropertyValueUint32(ctx, tex_arr, tex_idx, ro->textures[tex_idx], JS_PROP_C_W_E);
 	JS_FreeValue(ctx, tex_arr);
 
-	ro->m.texture_count = (ro->m.texture_count < (tex_idx+1)? (tex_idx+1) : ro->m.texture_count);
+	ro->native.m.texture_count = (ro->native.m.texture_count < (tex_idx+1)? (tex_idx+1) : ro->native.m.texture_count);
 
 	return JS_UNDEFINED;
 }
@@ -581,7 +529,7 @@ static JSValue athena_gettexture(JSContext *ctx, JSValue this_val, int argc, JSV
 
 	JS_ToUint32(ctx, &tex_idx, argv[0]);
 
-	if (ro->m.texture_count > tex_idx) {
+	if (ro->native.m.texture_count > tex_idx) {
 		JS_DupValue(ctx, ro->textures[tex_idx]);
 		return ro->textures[tex_idx];
 	}
@@ -592,21 +540,21 @@ static JSValue athena_gettexture(JSContext *ctx, JSValue this_val, int argc, JSV
 static JSValue athena_pushtexture(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv){
 	JSRenderData* ro = JS_GetOpaque2(ctx, this_val, js_render_data_class_id);
 
-	uint32_t tex_idx = ro->m.texture_count++;
+	uint32_t tex_idx = ro->native.m.texture_count++;
 
-	ro->m.textures = realloc(ro->m.textures, sizeof(GSSURFACE*)*(ro->m.texture_count));
-	ro->textures =   realloc(ro->textures,   sizeof(JSValue)*(ro->m.texture_count));
-	ro->m.textures[tex_idx] = NULL;
+	ro->native.m.textures = realloc(ro->native.m.textures, sizeof(GSSURFACE*)*(ro->native.m.texture_count));
+	ro->textures =   realloc(ro->textures,   sizeof(JSValue)*(ro->native.m.texture_count));
+	ro->native.m.textures[tex_idx] = NULL;
 
-	if (ro->m.textures[tex_idx]) {
+	if (ro->native.m.textures[tex_idx]) {
 		//JS_FreeValue(ctx, ro->textures[tex_idx]);
 	}
 
 	JS_DupValue(ctx, argv[0]);
-	JSImageData* image = JS_GetOpaque2(ctx, argv[0], get_img_class_id());
+	AthenaImage* image = JS_GetOpaque2(ctx, argv[0], get_img_class_id());
 
 	ro->textures[tex_idx] = argv[0];
-	ro->m.textures[tex_idx] = image->tex;
+	ro->native.m.textures[tex_idx] = image->tex;
 
 	JSValue tex_arr = JS_GetPropertyStr(ctx, this_val, "textures");
 	JS_DefinePropertyValueUint32(ctx, tex_arr, tex_idx, ro->textures[tex_idx], JS_PROP_C_W_E);
@@ -634,54 +582,47 @@ static JSValue js_wrap_render_data(JSContext *ctx, athena_render_data *m) {
     }
 
     // move the struct into JS wrapper (shallow move)
-    memcpy(&ro->m, m, sizeof(athena_render_data));
+    memcpy(&ro->native.m, m, sizeof(athena_render_data));
     free(m);
 
     JSValue obj = JS_NewObjectClass(ctx, js_render_data_class_id);
     if (JS_IsException(obj)) {
         // manual cleanup mirroring destructor
-        if (ro->m.indices) free(ro->m.indices);
-        if (ro->m.positions) free(ro->m.positions);
-        if (ro->m.colours) free(ro->m.colours);
-        if (ro->m.normals) free(ro->m.normals);
-        if (ro->m.texcoords) free(ro->m.texcoords);
-        if (ro->m.materials) free(ro->m.materials);
-        if (ro->m.material_indices) free(ro->m.material_indices);
-        if (ro->m.skin_data) free(ro->m.skin_data);
-        if (ro->m.skeleton) {
-            if (ro->m.skeleton->bones) free(ro->m.skeleton->bones);
-            free(ro->m.skeleton);
+        if (ro->native.m.indices) free(ro->native.m.indices);
+        if (ro->native.m.positions) free(ro->native.m.positions);
+        if (ro->native.m.colours) free(ro->native.m.colours);
+        if (ro->native.m.normals) free(ro->native.m.normals);
+        if (ro->native.m.texcoords) free(ro->native.m.texcoords);
+        if (ro->native.m.materials) free(ro->native.m.materials);
+        if (ro->native.m.material_indices) free(ro->native.m.material_indices);
+        if (ro->native.m.skin_data) free(ro->native.m.skin_data);
+        if (ro->native.m.skeleton) {
+            if (ro->native.m.skeleton->bones) free(ro->native.m.skeleton->bones);
+            free(ro->native.m.skeleton);
         }
-        if (ro->m.textures) free(ro->m.textures);
+        if (ro->native.m.textures) free(ro->native.m.textures);
         js_free(ctx, ro);
         return JS_EXCEPTION;
     }
 
     // Ensure sane defaults like the RenderData constructor
-    ro->m.pipeline = PL_DEFAULT;
-    ro->m.attributes.accurate_clipping = 1;
-    ro->m.attributes.face_culling = CULL_FACE_BACK;
-    ro->m.attributes.texture_mapping = 1;
-    ro->m.attributes.shade_model = 1; // gouraud
+    ro->native.m.pipeline = PL_DEFAULT;
+    ro->native.m.attributes.accurate_clipping = 1;
+    ro->native.m.attributes.face_culling = CULL_FACE_BACK;
+    ro->native.m.attributes.texture_mapping = 1;
+    ro->native.m.attributes.shade_model = 1; // gouraud
 
     // Wrap native textures into JS Image objects for 'textures' array
-    if (ro->m.texture_count > 0 && ro->m.textures) {
-        ro->textures = malloc(sizeof(JSValue)*ro->m.texture_count);
+    if (ro->native.m.texture_count > 0 && ro->native.m.textures) {
+        ro->textures = malloc(sizeof(JSValue)*ro->native.m.texture_count);
         JSValue tex_arr = JS_NewArray(ctx);
-        for (int i = 0; i < ro->m.texture_count; i++) {
-            JSImageData* image = js_mallocz(ctx, sizeof(*image));
+        for (int i = 0; i < ro->native.m.texture_count; i++) {
+            AthenaImage* image = athena_image_wrap(ro->native.m.textures[i], true);
             JSValue img_obj = JS_NewObjectClass(ctx, get_img_class_id());
-            image->delayed = true;
-            image->tex = ro->m.textures[i];
-            image->loaded = true;
-            image->width = image->tex->Width;
-            image->height = image->tex->Height;
-            image->endx = image->tex->Width;
-            image->endy = image->tex->Height;
-            image->startx = 0.0f;
-            image->starty = 0.0f;
-            image->angle = 0.0f;
-            image->color = 0x80808080;
+            if (!image || JS_IsException(img_obj)) {
+                athena_image_destroy(image);
+                return JS_EXCEPTION;
+            }
             JS_SetOpaque(img_obj, image);
             ro->textures[i] = img_obj;
             JS_DefinePropertyValueUint32(ctx, tex_arr, i, img_obj, JS_PROP_C_W_E);
@@ -689,7 +630,7 @@ static JSValue js_wrap_render_data(JSContext *ctx, athena_render_data *m) {
         JS_DefinePropertyValueStr(ctx, obj, "textures", tex_arr, JS_PROP_C_W_E);
     }
 
-    ro->m.tristrip = ro->m.tristrip;
+    ro->native.m.tristrip = ro->native.m.tristrip;
     JS_SetOpaque(obj, ro);
 
     // Flush dcache so VIF/DMAC see coherent vertex/material data
@@ -734,17 +675,17 @@ static JSValue js_render_data_get(JSContext *ctx, JSValueConst this_val, int mag
 			{
 				JSValue obj = JS_NewObject(ctx);
 
-				if (ro->m.positions)
-					JS_DefinePropertyValueStr(ctx, obj, "positions", JS_NewArrayBuffer(ctx, ro->m.positions, ro->m.index_count*sizeof(VECTOR), NULL, NULL, false), JS_PROP_C_W_E);
+				if (ro->native.m.positions)
+					JS_DefinePropertyValueStr(ctx, obj, "positions", JS_NewArrayBuffer(ctx, ro->native.m.positions, ro->native.m.index_count*sizeof(VECTOR), NULL, NULL, false), JS_PROP_C_W_E);
 
-				if (ro->m.normals)
-					JS_DefinePropertyValueStr(ctx, obj, "normals",   JS_NewArrayBuffer(ctx, ro->m.normals, ro->m.index_count*sizeof(VECTOR), NULL, NULL, false), JS_PROP_C_W_E);
+				if (ro->native.m.normals)
+					JS_DefinePropertyValueStr(ctx, obj, "normals",   JS_NewArrayBuffer(ctx, ro->native.m.normals, ro->native.m.index_count*sizeof(VECTOR), NULL, NULL, false), JS_PROP_C_W_E);
 
-				if (ro->m.texcoords)
-					JS_DefinePropertyValueStr(ctx, obj, "texcoords", JS_NewArrayBuffer(ctx, ro->m.texcoords, ro->m.index_count*sizeof(VECTOR), NULL, NULL, false), JS_PROP_C_W_E);
+				if (ro->native.m.texcoords)
+					JS_DefinePropertyValueStr(ctx, obj, "texcoords", JS_NewArrayBuffer(ctx, ro->native.m.texcoords, ro->native.m.index_count*sizeof(VECTOR), NULL, NULL, false), JS_PROP_C_W_E);
 
-				if (ro->m.colours)
-					JS_DefinePropertyValueStr(ctx, obj, "colors",    JS_NewArrayBuffer(ctx, ro->m.colours, ro->m.index_count*sizeof(VECTOR), NULL, NULL, false), JS_PROP_C_W_E);
+				if (ro->native.m.colours)
+					JS_DefinePropertyValueStr(ctx, obj, "colors",    JS_NewArrayBuffer(ctx, ro->native.m.colours, ro->native.m.index_count*sizeof(VECTOR), NULL, NULL, false), JS_PROP_C_W_E);
 
 				return obj;
 			}
@@ -752,23 +693,23 @@ static JSValue js_render_data_get(JSContext *ctx, JSValueConst this_val, int mag
 			{
 				JSValue arr = JS_NewArray(ctx);
 
-				for (int i = 0; i < ro->m.material_count; i++) {
+				for (int i = 0; i < ro->native.m.material_count; i++) {
 					JSValue obj = JS_NewObject(ctx);
 
-					JS_DefinePropertyValueStr(ctx, obj, "ambient", JS_NewMaterial(ctx, &ro->m.materials[i].ambient), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "diffuse", JS_NewMaterial(ctx, &ro->m.materials[i].diffuse), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "specular", JS_NewMaterial(ctx, &ro->m.materials[i].specular), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "emission", JS_NewMaterial(ctx, &ro->m.materials[i].emission), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "transmittance", JS_NewMaterial(ctx, &ro->m.materials[i].transmittance), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "shininess", JS_NewFloat32(ctx, ro->m.materials[i].shininess), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "refraction", JS_NewFloat32(ctx, ro->m.materials[i].refraction), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "transmission_filter", JS_NewMaterial(ctx, &ro->m.materials[i].transmission_filter), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "disolve", JS_NewFloat32(ctx, ro->m.materials[i].disolve), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "ambient", JS_NewMaterial(ctx, &ro->native.m.materials[i].ambient), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "diffuse", JS_NewMaterial(ctx, &ro->native.m.materials[i].diffuse), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "specular", JS_NewMaterial(ctx, &ro->native.m.materials[i].specular), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "emission", JS_NewMaterial(ctx, &ro->native.m.materials[i].emission), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "transmittance", JS_NewMaterial(ctx, &ro->native.m.materials[i].transmittance), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "shininess", JS_NewFloat32(ctx, ro->native.m.materials[i].shininess), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "refraction", JS_NewFloat32(ctx, ro->native.m.materials[i].refraction), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "transmission_filter", JS_NewMaterial(ctx, &ro->native.m.materials[i].transmission_filter), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "disolve", JS_NewFloat32(ctx, ro->native.m.materials[i].disolve), JS_PROP_C_W_E);
 
-					JS_DefinePropertyValueStr(ctx, obj, "texture_id", JS_NewInt32(ctx, ro->m.materials[i].texture_id), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "ref_texture_id", JS_NewInt32(ctx, ro->m.materials[i].ref_texture_id), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "bump_texture_id", JS_NewInt32(ctx, ro->m.materials[i].bump_texture_id), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "decal_texture_id", JS_NewInt32(ctx, ro->m.materials[i].decal_texture_id), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "texture_id", JS_NewInt32(ctx, ro->native.m.materials[i].texture_id), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "ref_texture_id", JS_NewInt32(ctx, ro->native.m.materials[i].ref_texture_id), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "bump_texture_id", JS_NewInt32(ctx, ro->native.m.materials[i].bump_texture_id), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "decal_texture_id", JS_NewInt32(ctx, ro->native.m.materials[i].decal_texture_id), JS_PROP_C_W_E);
 
 					JS_DefinePropertyValueUint32(ctx, arr, i, obj, JS_PROP_C_W_E);
 				}
@@ -779,11 +720,11 @@ static JSValue js_render_data_get(JSContext *ctx, JSValueConst this_val, int mag
 			{
 				JSValue arr = JS_NewArray(ctx);
 
-				for (int i = 0; i < ro->m.material_index_count; i++) {
+				for (int i = 0; i < ro->native.m.material_index_count; i++) {
 					JSValue obj = JS_NewObject(ctx);
 
-					JS_DefinePropertyValueStr(ctx, obj, "index", JS_NewUint32(ctx, ro->m.material_indices[i].index), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "end",   JS_NewUint32(ctx, ro->m.material_indices[i].end),   JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "index", JS_NewUint32(ctx, ro->native.m.material_indices[i].index), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "end",   JS_NewUint32(ctx, ro->native.m.material_indices[i].end),   JS_PROP_C_W_E);
 
 					JS_DefinePropertyValueUint32(ctx, arr, i, obj, JS_PROP_C_W_E);
 				}
@@ -791,15 +732,15 @@ static JSValue js_render_data_get(JSContext *ctx, JSValueConst this_val, int mag
 				return arr;
 			}
 		case 3:
-			return JS_NewBool(ctx,   ro->m.attributes.accurate_clipping);
+			return JS_NewBool(ctx,   ro->native.m.attributes.accurate_clipping);
 		case 4:
-			return JS_NewFloat32(ctx,   ro->m.attributes.face_culling);
+			return JS_NewFloat32(ctx,   ro->native.m.attributes.face_culling);
 		case 5:
-			return JS_NewBool(ctx,   ro->m.attributes.texture_mapping);
+			return JS_NewBool(ctx,   ro->native.m.attributes.texture_mapping);
 		case 6:
-			return JS_NewUint32(ctx,   ro->m.attributes.shade_model);
+			return JS_NewUint32(ctx,   ro->native.m.attributes.shade_model);
 		case 7:
-			return JS_NewUint32(ctx, ro->m.index_count);
+			return JS_NewUint32(ctx, ro->native.m.index_count);
 		case 8:
 			{
 				JSValue array = JS_NewArray(ctx);
@@ -807,9 +748,9 @@ static JSValue js_render_data_get(JSContext *ctx, JSValueConst this_val, int mag
 				for (int i = 0; i < 8; i++) {
 					JSValue obj = JS_NewObject(ctx);
 
-					JS_DefinePropertyValueStr(ctx, obj, "x", JS_NewFloat32(ctx, ro->m.bounding_box[i][0]), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "y", JS_NewFloat32(ctx, ro->m.bounding_box[i][1]), JS_PROP_C_W_E);
-					JS_DefinePropertyValueStr(ctx, obj, "z", JS_NewFloat32(ctx, ro->m.bounding_box[i][2]), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "x", JS_NewFloat32(ctx, ro->native.m.bounding_box[i][0]), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "y", JS_NewFloat32(ctx, ro->native.m.bounding_box[i][1]), JS_PROP_C_W_E);
+					JS_DefinePropertyValueStr(ctx, obj, "z", JS_NewFloat32(ctx, ro->native.m.bounding_box[i][2]), JS_PROP_C_W_E);
 					JS_DefinePropertyValueUint32(ctx, array, i, obj, JS_PROP_C_W_E);
 				}
 
@@ -834,10 +775,10 @@ static JSValue js_render_data_set(JSContext *ctx, JSValueConst this_val, JSValue
 				void *tmp_vert_ptr = NULL;
 
 				VECTOR** attributes_ptr[] = {
-					&ro->m.positions,
-					&ro->m.normals,
-					&ro->m.texcoords,
-					&ro->m.colours
+					&ro->native.m.positions,
+					&ro->native.m.normals,
+					&ro->native.m.texcoords,
+					&ro->native.m.colours
 				};
 
 				for (int i = 0; i < 4; i++) {
@@ -851,7 +792,7 @@ static JSValue js_render_data_set(JSContext *ctx, JSValueConst this_val, JSValue
 					tmp_vert_ptr = JS_GetArrayBuffer(ctx, &size, ((ta_buf != JS_EXCEPTION)? ta_buf : vert_arr));
 
 					if (!i)
-						ro->m.index_count = size/sizeof(VECTOR);
+						ro->native.m.index_count = size/sizeof(VECTOR);
 
 					if (tmp_vert_ptr) {
 						*attributes_ptr[i] = malloc(size);
@@ -869,46 +810,46 @@ static JSValue js_render_data_set(JSContext *ctx, JSValueConst this_val, JSValue
 
 				JS_ToUint32(ctx, &material_count, JS_GetPropertyStr(ctx, val, "length"));
 
-				if (material_count > ro->m.material_count) {
-					ro->m.materials = realloc(ro->m.materials, material_count);
+				if (material_count > ro->native.m.material_count) {
+					ro->native.m.materials = realloc(ro->native.m.materials, material_count);
 				}
 
 				for (int i = 0; i < material_count; i++) {
 					JSValue obj = JS_GetPropertyUint32(ctx, val, i);
 
-					JS_ToMaterial(ctx, &ro->m.materials[i].ambient,             JS_GetPropertyStr(ctx, obj, "ambient"));
-					JS_ToMaterial(ctx, &ro->m.materials[i].diffuse,             JS_GetPropertyStr(ctx, obj, "diffuse"));
-					//JS_ToMaterial(ctx, &ro->m.materials[i].specular,            JS_GetPropertyStr(ctx, obj, "specular"));
-					JS_ToMaterial(ctx, &ro->m.materials[i].emission,            JS_GetPropertyStr(ctx, obj, "emission"));
-					JS_ToMaterial(ctx, &ro->m.materials[i].transmittance,       JS_GetPropertyStr(ctx, obj, "transmittance"));
-					JS_ToFloat32(ctx,  &ro->m.materials[i].shininess,           JS_GetPropertyStr(ctx, obj, "shininess"));
-					JS_ToFloat32(ctx,  &ro->m.materials[i].refraction,          JS_GetPropertyStr(ctx, obj, "refraction"));
-					JS_ToMaterial(ctx, &ro->m.materials[i].transmission_filter, JS_GetPropertyStr(ctx, obj, "transmission_filter"));
-					JS_ToFloat32(ctx,  &ro->m.materials[i].disolve,             JS_GetPropertyStr(ctx, obj, "disolve"));
+					JS_ToMaterial(ctx, &ro->native.m.materials[i].ambient,             JS_GetPropertyStr(ctx, obj, "ambient"));
+					JS_ToMaterial(ctx, &ro->native.m.materials[i].diffuse,             JS_GetPropertyStr(ctx, obj, "diffuse"));
+					//JS_ToMaterial(ctx, &ro->native.m.materials[i].specular,            JS_GetPropertyStr(ctx, obj, "specular"));
+					JS_ToMaterial(ctx, &ro->native.m.materials[i].emission,            JS_GetPropertyStr(ctx, obj, "emission"));
+					JS_ToMaterial(ctx, &ro->native.m.materials[i].transmittance,       JS_GetPropertyStr(ctx, obj, "transmittance"));
+					JS_ToFloat32(ctx,  &ro->native.m.materials[i].shininess,           JS_GetPropertyStr(ctx, obj, "shininess"));
+					JS_ToFloat32(ctx,  &ro->native.m.materials[i].refraction,          JS_GetPropertyStr(ctx, obj, "refraction"));
+					JS_ToMaterial(ctx, &ro->native.m.materials[i].transmission_filter, JS_GetPropertyStr(ctx, obj, "transmission_filter"));
+					JS_ToFloat32(ctx,  &ro->native.m.materials[i].disolve,             JS_GetPropertyStr(ctx, obj, "disolve"));
 
-					JS_ToInt32(ctx,    &ro->m.materials[i].texture_id,          JS_GetPropertyStr(ctx, obj, "texture_id"));
-					JS_ToInt32(ctx,    &ro->m.materials[i].ref_texture_id,          JS_GetPropertyStr(ctx, obj, "ref_texture_id"));
+					JS_ToInt32(ctx,    &ro->native.m.materials[i].texture_id,          JS_GetPropertyStr(ctx, obj, "texture_id"));
+					JS_ToInt32(ctx,    &ro->native.m.materials[i].ref_texture_id,          JS_GetPropertyStr(ctx, obj, "ref_texture_id"));
 
-					if (ro->m.materials[i].ref_texture_id != -1 && !ro->m.attributes.has_refmap) {
-						ro->m.attributes.has_refmap = true;
+					if (ro->native.m.materials[i].ref_texture_id != -1 && !ro->native.m.attributes.has_refmap) {
+						ro->native.m.attributes.has_refmap = true;
 					}
 
-					JS_ToInt32(ctx,    &ro->m.materials[i].bump_texture_id,          JS_GetPropertyStr(ctx, obj, "bump_texture_id"));
+					JS_ToInt32(ctx,    &ro->native.m.materials[i].bump_texture_id,          JS_GetPropertyStr(ctx, obj, "bump_texture_id"));
 
-					if (ro->m.materials[i].bump_texture_id != -1 && !ro->m.attributes.has_bumpmap) {
-						ro->m.attributes.has_bumpmap = true;
+					if (ro->native.m.materials[i].bump_texture_id != -1 && !ro->native.m.attributes.has_bumpmap) {
+						ro->native.m.attributes.has_bumpmap = true;
 					}
 
-					JS_ToInt32(ctx,    &ro->m.materials[i].decal_texture_id,          JS_GetPropertyStr(ctx, obj, "decal_texture_id"));
+					JS_ToInt32(ctx,    &ro->native.m.materials[i].decal_texture_id,          JS_GetPropertyStr(ctx, obj, "decal_texture_id"));
 
-					if (ro->m.materials[i].decal_texture_id != -1 && !ro->m.attributes.has_decal) {
-						ro->m.attributes.has_decal = true;
+					if (ro->native.m.materials[i].decal_texture_id != -1 && !ro->native.m.attributes.has_decal) {
+						ro->native.m.attributes.has_decal = true;
 					}
 
 					JS_FreeValue(ctx, obj);
 				}
 
-				ro->m.material_count = material_count;
+				ro->native.m.material_count = material_count;
 
 				FlushCache(WRITEBACK_DCACHE);
 			}
@@ -919,39 +860,39 @@ static JSValue js_render_data_set(JSContext *ctx, JSValueConst this_val, JSValue
 
 				JS_ToUint32(ctx, &material_index_count, JS_GetPropertyStr(ctx, val, "length"));
 
-				if (material_index_count > ro->m.material_index_count) {
-					ro->m.material_indices = realloc(ro->m.material_indices, material_index_count);
+				if (material_index_count > ro->native.m.material_index_count) {
+					ro->native.m.material_indices = realloc(ro->native.m.material_indices, material_index_count);
 				}
 
 				for (int i = 0; i < material_index_count; i++) {
 					JSValue obj = JS_GetPropertyUint32(ctx, val, i);
 
-					JS_ToUint32(ctx, &ro->m.material_indices[i].index, JS_GetPropertyStr(ctx, obj, "index"));
-					JS_ToUint32(ctx, &ro->m.material_indices[i].end,   JS_GetPropertyStr(ctx, obj, "end"));
+					JS_ToUint32(ctx, &ro->native.m.material_indices[i].index, JS_GetPropertyStr(ctx, obj, "index"));
+					JS_ToUint32(ctx, &ro->native.m.material_indices[i].end,   JS_GetPropertyStr(ctx, obj, "end"));
 
 					JS_FreeValue(ctx, obj);
 				}
 
-				ro->m.material_index_count = material_index_count;
+				ro->native.m.material_index_count = material_index_count;
 
 				FlushCache(WRITEBACK_DCACHE);
 			}
 			break;
 		case 3:
-			ro->m.attributes.accurate_clipping = JS_ToBool(ctx, val);
+			ro->native.m.attributes.accurate_clipping = JS_ToBool(ctx, val);
 			break;
 		case 4:
-			JS_ToFloat32(ctx, &ro->m.attributes.face_culling, val);
+			JS_ToFloat32(ctx, &ro->native.m.attributes.face_culling, val);
 			break;
 		case 5:
-			ro->m.attributes.texture_mapping = JS_ToBool(ctx, val);
+			ro->native.m.attributes.texture_mapping = JS_ToBool(ctx, val);
 			break;
 		case 6:
 			{
 				uint32_t shade_model;
 				JS_ToUint32(ctx, &shade_model, val);
 
-				ro->m.attributes.shade_model = shade_model;
+				ro->native.m.attributes.shade_model = shade_model;
 			}
 			break;
 		case 7:
@@ -960,10 +901,10 @@ static JSValue js_render_data_set(JSContext *ctx, JSValueConst this_val, JSValue
 			for (int i = 0; i < 8; i++) {
 				JSValue vertex = JS_GetPropertyUint32(ctx, val, i);
 
-				JS_ToFloat32(ctx, &ro->m.bounding_box[i][0], JS_GetPropertyStr(ctx, vertex, "x"));
-				JS_ToFloat32(ctx, &ro->m.bounding_box[i][1], JS_GetPropertyStr(ctx, vertex, "y"));
-				JS_ToFloat32(ctx, &ro->m.bounding_box[i][2], JS_GetPropertyStr(ctx, vertex, "z"));
-				ro->m.bounding_box[i][3] = 1.0f;
+				JS_ToFloat32(ctx, &ro->native.m.bounding_box[i][0], JS_GetPropertyStr(ctx, vertex, "x"));
+				JS_ToFloat32(ctx, &ro->native.m.bounding_box[i][1], JS_GetPropertyStr(ctx, vertex, "y"));
+				JS_ToFloat32(ctx, &ro->native.m.bounding_box[i][2], JS_GetPropertyStr(ctx, vertex, "z"));
+				ro->native.m.bounding_box[i][3] = 1.0f;
 
 				JS_FreeValue(ctx, vertex);
 			}
@@ -1013,11 +954,11 @@ static JSValue athena_renderdata_update_material(JSContext *ctx, JSValueConst th
 
 	uint32_t index = 0;
 	JS_ToUint32(ctx, &index, argv[0]);
-	if (index >= ro->m.material_count)
+	if (index >= ro->native.m.material_count)
 		return JS_ThrowRangeError(ctx, "material index out of range");
 
 	JSValue props = argv[1];
-	ath_mat *mat = &ro->m.materials[index];
+	ath_mat *mat = &ro->native.m.materials[index];
 
 	js_apply_color_prop(ctx, props, "ambient", mat->ambient);
 	js_apply_color_prop(ctx, props, "diffuse", mat->diffuse);
@@ -1074,63 +1015,63 @@ static JSValue athena_renderdata_clone(JSContext *ctx, JSValue this_val, int arg
 		return JS_EXCEPTION;
 
 	// Share geometry buffers (reference same memory)
-	ro->m.index_count = src->m.index_count;
-	ro->m.indices = src->m.indices; // shared
-	ro->m.positions = src->m.positions; // shared
-	ro->m.normals = src->m.normals; // shared
-	ro->m.texcoords = src->m.texcoords; // shared
-	ro->m.colours = src->m.colours; // shared
-	ro->m.skin_data = src->m.skin_data; // shared
-	ro->m.skeleton = src->m.skeleton; // shared
-	ro->m.tristrip = src->m.tristrip;
+	ro->native.m.index_count = src->native.m.index_count;
+	ro->native.m.indices = src->native.m.indices; // shared
+	ro->native.m.positions = src->native.m.positions; // shared
+	ro->native.m.normals = src->native.m.normals; // shared
+	ro->native.m.texcoords = src->native.m.texcoords; // shared
+	ro->native.m.colours = src->native.m.colours; // shared
+	ro->native.m.skin_data = src->native.m.skin_data; // shared
+	ro->native.m.skeleton = src->native.m.skeleton; // shared
+	ro->native.m.tristrip = src->native.m.tristrip;
 
 	// Mark as not owning vertices (prevent double-free)
 	for (int i = 0; i < 4; i++) {
-		ro->owns_vertices[i] = false;
+		ro->native.owns_vertices[i] = false;
 		ro->vertex_buffers[i] = JS_UNDEFINED;
 	}
 
 	// Clone materials (independent copy)
-	if (src->m.material_count > 0) {
-		ro->m.material_count = src->m.material_count;
-		ro->m.materials = malloc(sizeof(ath_mat) * ro->m.material_count);
-		memcpy(ro->m.materials, src->m.materials, sizeof(ath_mat) * ro->m.material_count);
+	if (src->native.m.material_count > 0) {
+		ro->native.m.material_count = src->native.m.material_count;
+		ro->native.m.materials = malloc(sizeof(ath_mat) * ro->native.m.material_count);
+		memcpy(ro->native.m.materials, src->native.m.materials, sizeof(ath_mat) * ro->native.m.material_count);
 	}
 
 	// Clone material indices (independent copy)
-	if (src->m.material_index_count > 0) {
-		ro->m.material_index_count = src->m.material_index_count;
-		ro->m.material_indices = malloc(sizeof(material_index) * ro->m.material_index_count);
-		memcpy(ro->m.material_indices, src->m.material_indices, sizeof(material_index) * ro->m.material_index_count);
+	if (src->native.m.material_index_count > 0) {
+		ro->native.m.material_index_count = src->native.m.material_index_count;
+		ro->native.m.material_indices = malloc(sizeof(material_index) * ro->native.m.material_index_count);
+		memcpy(ro->native.m.material_indices, src->native.m.material_indices, sizeof(material_index) * ro->native.m.material_index_count);
 	}
 
 	// Share textures (reference same pointers)
-	ro->m.texture_count = src->m.texture_count;
-	if (src->m.texture_count > 0) {
-		ro->m.textures = malloc(sizeof(GSSURFACE*) * ro->m.texture_count);
-		memcpy(ro->m.textures, src->m.textures, sizeof(GSSURFACE*) * ro->m.texture_count);
+	ro->native.m.texture_count = src->native.m.texture_count;
+	if (src->native.m.texture_count > 0) {
+		ro->native.m.textures = malloc(sizeof(GSSURFACE*) * ro->native.m.texture_count);
+		memcpy(ro->native.m.textures, src->native.m.textures, sizeof(GSSURFACE*) * ro->native.m.texture_count);
 
-		ro->textures = malloc(sizeof(JSValue) * ro->m.texture_count);
-		for (int i = 0; i < ro->m.texture_count; i++) {
+		ro->textures = malloc(sizeof(JSValue) * ro->native.m.texture_count);
+		for (int i = 0; i < ro->native.m.texture_count; i++) {
 			ro->textures[i] = JS_DupValue(ctx, src->textures[i]);
 		}
 	}
 
 	// Copy bounding box
-	memcpy(ro->m.bounding_box, src->m.bounding_box, sizeof(ro->m.bounding_box));
+	memcpy(ro->native.m.bounding_box, src->native.m.bounding_box, sizeof(ro->native.m.bounding_box));
 
 	// Copy attributes and pipeline
-	ro->m.pipeline = src->m.pipeline;
-	ro->m.attributes = src->m.attributes;
+	ro->native.m.pipeline = src->native.m.pipeline;
+	ro->native.m.attributes = src->native.m.attributes;
 
 	// Create JS object
 	JSValue obj = JS_NewObjectClass(ctx, js_render_data_class_id);
 	if (JS_IsException(obj)) {
-		if (ro->m.materials) free(ro->m.materials);
-		if (ro->m.material_indices) free(ro->m.material_indices);
-		if (ro->m.textures) free(ro->m.textures);
+		if (ro->native.m.materials) free(ro->native.m.materials);
+		if (ro->native.m.material_indices) free(ro->native.m.material_indices);
+		if (ro->native.m.textures) free(ro->native.m.textures);
 		if (ro->textures) {
-			for (int i = 0; i < ro->m.texture_count; i++)
+			for (int i = 0; i < ro->native.m.texture_count; i++)
 				JS_FreeValue(ctx, ro->textures[i]);
 			free(ro->textures);
 		}
@@ -1151,8 +1092,8 @@ static const JSCFunctionListEntry js_render_data_proto_funcs[] = {
 
 	JS_CFUNC_DEF("pushTexture",  1,  athena_pushtexture),
 
-	JS_CFUNC_DEF("free",  0,  athena_rdfree),
-	JS_CFUNC_DEF("dispose",  0,  athena_rdfree),
+	JS_CFUNC_DEF("free",  0,  js_rdfree),
+	JS_CFUNC_DEF("dispose",  0,  js_rdfree),
 
 	JS_CFUNC_DEF("clone",  0,  athena_renderdata_clone),
 
@@ -1173,45 +1114,34 @@ static const JSCFunctionListEntry js_render_data_proto_funcs[] = {
 
 JSClassID js_render_object_class_id;
 
-static void athena_render_object_dtor(JSRuntime *rt, JSValue val){
+static void js_render_object_finalizer(JSRuntime *rt, JSValue val){
 	JSRenderObject* ro = JS_GetOpaque(val, js_render_object_class_id);
 
     if (!ro)
         return;
 
-	if (ro->obj.bones) {
-		free(ro->obj.bones);
-		free(ro->obj.bone_matrices);
-	}
-
+	athena_render_object_destroy(ro->native);
 	js_free_rt(rt, ro);
-	
 	JS_SetOpaque(val, NULL);
 }
 
-static JSValue athena_play_anim(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv){
+static JSValue js_play_anim(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv){
 	JSRenderObject* ro = JS_GetOpaque2(ctx, this_val, js_render_object_class_id);
-
 	athena_animation *anim = NULL;
 
 	JS_ToUint32(ctx, &anim, argv[0]);
-
-	ro->obj.anim_controller.current = anim;
-	ro->obj.anim_controller.is_playing = false;
-	ro->obj.anim_controller.loop = JS_ToBool(ctx, argv[1]);
-
+	athena_render_object_play_anim(ro->native, anim, JS_ToBool(ctx, argv[1]));
 	return JS_UNDEFINED;
 }
 
-static JSValue athena_is_playing(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv){
+static JSValue js_is_playing_anim(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv){
 	JSRenderObject* ro = JS_GetOpaque2(ctx, this_val, js_render_object_class_id);
-
 	athena_animation *anim = NULL;
 
 	if (argc > 0)
 		JS_ToUint32(ctx, &anim, argv[0]);
 
-	return JS_NewBool(ctx, (ro->obj.anim_controller.current && (ro->obj.anim_controller.current == anim)) );
+	return JS_NewBool(ctx, athena_render_object_is_playing_anim(ro->native, anim));
 }
 
 static JSValue athena_render_object_ctor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
@@ -1229,48 +1159,52 @@ static JSValue athena_render_object_ctor(JSContext *ctx, JSValueConst new_target
         return JS_EXCEPTION;
     }
 
-	new_render_object(&ro->obj, &rd->m);
+	ro->native = athena_render_object_create(&rd->native);
+	if (!ro->native) {
+		js_free(ctx, ro);
+		return JS_EXCEPTION;
+	}
 
     JSValue transform_matrix = JS_UNDEFINED;
 
     transform_matrix = JS_NewObjectClass(ctx, get_matrix4_class_id());
 
-    JS_SetOpaque(transform_matrix, &ro->obj.transform);
+    JS_SetOpaque(transform_matrix, &js_ro_data(ro)->transform);
 
     proto = JS_GetPropertyStr(ctx, new_target, "prototype");
     obj = JS_NewObjectProtoClass(ctx, proto, js_render_object_class_id);
 
 	JS_DefinePropertyValueStr(ctx, obj, "transform", transform_matrix, JS_PROP_C_W_E);
 
-	if (ro->obj.data->skin_data) {
+	if (js_ro_data(ro)->data->skin_data) {
 		JSValue bone_transforms = JS_NewArray(ctx);
 		JSValue bone_matrices = JS_NewArray(ctx);
 
 		// TODO: create a class for bones so they can be passed by reference
-		for (int i = 0; i < ro->obj.data->skeleton->bone_count; i++) {
+		for (int i = 0; i < js_ro_data(ro)->data->skeleton->bone_count; i++) {
 			JSValue bone = JS_NewObject(ctx);
 
 			JSValue bone_transform = JS_NewObjectClass(ctx, get_matrix4_class_id());
 
-			JS_SetOpaque(bone_transform, &ro->obj.bones[i].transform);
+			JS_SetOpaque(bone_transform, &js_ro_data(ro)->bones[i].transform);
 
 			JS_DefinePropertyValueStr(ctx, bone, "transform", bone_transform, JS_PROP_C_W_E);
 
 			JSValue bone_position = JS_NewObjectClass(ctx, get_vector4_class_id());
 
-			JS_SetOpaque(bone_position, &ro->obj.bones[i].position);
+			JS_SetOpaque(bone_position, &js_ro_data(ro)->bones[i].position);
 
 			JS_DefinePropertyValueStr(ctx, bone, "position", bone_position, JS_PROP_C_W_E);
 
 			JSValue bone_rotation = JS_NewObjectClass(ctx, get_vector4_class_id());
 
-			JS_SetOpaque(bone_rotation, &ro->obj.bones[i].rotation);
+			JS_SetOpaque(bone_rotation, &js_ro_data(ro)->bones[i].rotation);
 
 			JS_DefinePropertyValueStr(ctx, bone, "rotation", bone_rotation, JS_PROP_C_W_E);
 
 			JSValue bone_scale = JS_NewObjectClass(ctx, get_vector4_class_id());
 
-			JS_SetOpaque(bone_scale, &ro->obj.bones[i].scale);
+			JS_SetOpaque(bone_scale, &js_ro_data(ro)->bones[i].scale);
 
 			JS_DefinePropertyValueStr(ctx, bone, "scale", bone_scale, JS_PROP_C_W_E);
 
@@ -1278,7 +1212,7 @@ static JSValue athena_render_object_ctor(JSContext *ctx, JSValueConst new_target
 
     		JSValue bone_matrix = JS_NewObjectClass(ctx, get_matrix4_class_id());
 
-    		JS_SetOpaque(bone_matrix, &ro->obj.bone_matrices[i]);
+    		JS_SetOpaque(bone_matrix, &js_ro_data(ro)->bone_matrices[i]);
 
 			JS_DefinePropertyValueUint32(ctx, bone_matrices, i, bone_matrix, JS_PROP_C_W_E);
 		}
@@ -1286,8 +1220,8 @@ static JSValue athena_render_object_ctor(JSContext *ctx, JSValueConst new_target
 		JS_DefinePropertyValueStr(ctx, obj, "bone_matrices", bone_matrices, JS_PROP_C_W_E);
 		JS_DefinePropertyValueStr(ctx, obj, "bones", bone_transforms, JS_PROP_C_W_E);
 
-		JS_DefinePropertyValueStr(ctx, obj, "playAnim", JS_NewCFunction2(ctx, athena_play_anim, "playAnim", 2, JS_CFUNC_generic, 0), JS_PROP_C_W_E);
-		JS_DefinePropertyValueStr(ctx, obj, "isPlayingAnim", JS_NewCFunction2(ctx, athena_is_playing, "isPlayingAnim", 1, JS_CFUNC_generic, 0), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, obj, "playAnim", JS_NewCFunction2(ctx, js_play_anim, "playAnim", 2, JS_CFUNC_generic, 0), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, obj, "isPlayingAnim", JS_NewCFunction2(ctx, js_is_playing_anim, "isPlayingAnim", 1, JS_CFUNC_generic, 0), JS_PROP_C_W_E);
 	}
 
     // Keep a strong reference to the source RenderData to prevent premature GC
@@ -1301,19 +1235,19 @@ static JSValue athena_render_object_ctor(JSContext *ctx, JSValueConst new_target
 
 static JSClassDef js_render_object_class = {
     "RenderObject",
-    .finalizer = athena_render_object_dtor,
+    .finalizer = js_render_object_finalizer,
 }; 
 
-static JSValue athena_drawfree(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv){
-	athena_render_object_dtor(JS_GetRuntime(ctx), this_val);
+static JSValue js_drawfree(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv){
+	js_render_object_finalizer(JS_GetRuntime(ctx), this_val);
 
 	return JS_UNDEFINED;
 }
 
-static JSValue athena_drawobject(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv){
+static JSValue js_drawobject(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv){
 	JSRenderObject* ro = JS_GetOpaque2(ctx, this_val, js_render_object_class_id);
 
-	render_object(&ro->obj);
+	athena_render_object_draw(ro->native);
 
 	return JS_UNDEFINED;
 }
@@ -1324,14 +1258,14 @@ static JSValue athena_ro_collision(JSContext *ctx, JSValue this_val, int argc, J
 
 	if (!JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
 		JSGeom *geom = JS_GetOpaque(argv[0], js_geom_class_id);
-		ro->obj.collision = geom->geom;
-		ro->obj.update_collision = updateGeomPosRot;
+		js_ro_data(ro)->collision = geom->geom;
+		js_ro_data(ro)->update_collision = updateGeomPosRot;
 
-		update_object_space(&ro->obj);
+		update_object_space(js_ro_data(ro));
 		
 	} else {
-		ro->obj.collision = NULL;
-		ro->obj.update_collision = NULL;
+		js_ro_data(ro)->collision = NULL;
+		js_ro_data(ro)->update_collision = NULL;
 	}
 
 	return JS_UNDEFINED;
@@ -1342,13 +1276,13 @@ static JSValue athena_ro_physics(JSContext *ctx, JSValue this_val, int argc, JSV
 
 	if (!JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
 		JSBody *body = JS_GetOpaque(argv[0], js_body_class_id);
-		ro->obj.physics = body->body;
-		ro->obj.update_physics = updateBodyPosRot;
+		js_ro_data(ro)->physics = body->native->body;
+		js_ro_data(ro)->update_physics = updateBodyPosRot;
 
-		update_object_space(&ro->obj);
+		update_object_space(js_ro_data(ro));
 	} else {
-		ro->obj.physics = NULL;
-		ro->obj.update_physics = NULL;
+		js_ro_data(ro)->physics = NULL;
+		js_ro_data(ro)->update_physics = NULL;
 	}
 
 	return JS_UNDEFINED;
@@ -1366,7 +1300,7 @@ static JSValue athena_drawbbox(JSContext *ctx, JSValue this_val, int argc, JSVal
 		color = (Color)c32;
 	}
 	
-	draw_bbox(&ro->obj, color);
+	athena_render_object_draw_bbox(ro->native, color);
 
 	return JS_UNDEFINED;
 }
@@ -1384,9 +1318,9 @@ static JSValue js_render_object_get(JSContext *ctx, JSValueConst this_val, int m
 			{
 				JSValue obj = JS_NewObject(ctx);
 
-				JS_DefinePropertyValueStr(ctx, obj, "x", JS_NewFloat32(ctx, ro->obj.position[0]), JS_PROP_C_W_E);
-				JS_DefinePropertyValueStr(ctx, obj, "y", JS_NewFloat32(ctx, ro->obj.position[1]), JS_PROP_C_W_E);
-				JS_DefinePropertyValueStr(ctx, obj, "z", JS_NewFloat32(ctx, ro->obj.position[2]), JS_PROP_C_W_E);
+				JS_DefinePropertyValueStr(ctx, obj, "x", JS_NewFloat32(ctx, js_ro_data(ro)->position[0]), JS_PROP_C_W_E);
+				JS_DefinePropertyValueStr(ctx, obj, "y", JS_NewFloat32(ctx, js_ro_data(ro)->position[1]), JS_PROP_C_W_E);
+				JS_DefinePropertyValueStr(ctx, obj, "z", JS_NewFloat32(ctx, js_ro_data(ro)->position[2]), JS_PROP_C_W_E);
 				
 				return obj;
 			}
@@ -1394,9 +1328,9 @@ static JSValue js_render_object_get(JSContext *ctx, JSValueConst this_val, int m
 			{
 				JSValue obj = JS_NewObject(ctx);
 
-				JS_DefinePropertyValueStr(ctx, obj, "x", JS_NewFloat32(ctx, ro->obj.rotation[0]), JS_PROP_C_W_E);
-				JS_DefinePropertyValueStr(ctx, obj, "y", JS_NewFloat32(ctx, ro->obj.rotation[1]), JS_PROP_C_W_E);
-				JS_DefinePropertyValueStr(ctx, obj, "z", JS_NewFloat32(ctx, ro->obj.rotation[2]), JS_PROP_C_W_E);
+				JS_DefinePropertyValueStr(ctx, obj, "x", JS_NewFloat32(ctx, js_ro_data(ro)->rotation[0]), JS_PROP_C_W_E);
+				JS_DefinePropertyValueStr(ctx, obj, "y", JS_NewFloat32(ctx, js_ro_data(ro)->rotation[1]), JS_PROP_C_W_E);
+				JS_DefinePropertyValueStr(ctx, obj, "z", JS_NewFloat32(ctx, js_ro_data(ro)->rotation[2]), JS_PROP_C_W_E);
 				
 				return obj;
 			}
@@ -1404,9 +1338,9 @@ static JSValue js_render_object_get(JSContext *ctx, JSValueConst this_val, int m
 			{
 				JSValue obj = JS_NewObject(ctx);
 
-				JS_DefinePropertyValueStr(ctx, obj, "x", JS_NewFloat32(ctx, ro->obj.scale[0]), JS_PROP_C_W_E);
-				JS_DefinePropertyValueStr(ctx, obj, "y", JS_NewFloat32(ctx, ro->obj.scale[1]), JS_PROP_C_W_E);
-				JS_DefinePropertyValueStr(ctx, obj, "z", JS_NewFloat32(ctx, ro->obj.scale[2]), JS_PROP_C_W_E);
+				JS_DefinePropertyValueStr(ctx, obj, "x", JS_NewFloat32(ctx, js_ro_data(ro)->scale[0]), JS_PROP_C_W_E);
+				JS_DefinePropertyValueStr(ctx, obj, "y", JS_NewFloat32(ctx, js_ro_data(ro)->scale[1]), JS_PROP_C_W_E);
+				JS_DefinePropertyValueStr(ctx, obj, "z", JS_NewFloat32(ctx, js_ro_data(ro)->scale[2]), JS_PROP_C_W_E);
 				
 				return obj;
 			}
@@ -1424,23 +1358,23 @@ static JSValue js_render_object_set(JSContext *ctx, JSValueConst this_val, JSVal
 
 	switch (magic) {
 		case 0:
-			JS_ToFloat32(ctx, &ro->obj.position[0], JS_GetPropertyStr(ctx, val, "x"));
-			JS_ToFloat32(ctx, &ro->obj.position[1], JS_GetPropertyStr(ctx, val, "y"));
-			JS_ToFloat32(ctx, &ro->obj.position[2], JS_GetPropertyStr(ctx, val, "z"));
+			JS_ToFloat32(ctx, &js_ro_data(ro)->position[0], JS_GetPropertyStr(ctx, val, "x"));
+			JS_ToFloat32(ctx, &js_ro_data(ro)->position[1], JS_GetPropertyStr(ctx, val, "y"));
+			JS_ToFloat32(ctx, &js_ro_data(ro)->position[2], JS_GetPropertyStr(ctx, val, "z"));
 			break;
 		case 1:
-			JS_ToFloat32(ctx, &ro->obj.rotation[0], JS_GetPropertyStr(ctx, val, "x"));
-			JS_ToFloat32(ctx, &ro->obj.rotation[1], JS_GetPropertyStr(ctx, val, "y"));
-			JS_ToFloat32(ctx, &ro->obj.rotation[2], JS_GetPropertyStr(ctx, val, "z"));
+			JS_ToFloat32(ctx, &js_ro_data(ro)->rotation[0], JS_GetPropertyStr(ctx, val, "x"));
+			JS_ToFloat32(ctx, &js_ro_data(ro)->rotation[1], JS_GetPropertyStr(ctx, val, "y"));
+			JS_ToFloat32(ctx, &js_ro_data(ro)->rotation[2], JS_GetPropertyStr(ctx, val, "z"));
 			break;
 		case 2:
-			JS_ToFloat32(ctx, &ro->obj.scale[0], JS_GetPropertyStr(ctx, val, "x"));
-			JS_ToFloat32(ctx, &ro->obj.scale[1], JS_GetPropertyStr(ctx, val, "y"));
-			JS_ToFloat32(ctx, &ro->obj.scale[2], JS_GetPropertyStr(ctx, val, "z"));
+			JS_ToFloat32(ctx, &js_ro_data(ro)->scale[0], JS_GetPropertyStr(ctx, val, "x"));
+			JS_ToFloat32(ctx, &js_ro_data(ro)->scale[1], JS_GetPropertyStr(ctx, val, "y"));
+			JS_ToFloat32(ctx, &js_ro_data(ro)->scale[2], JS_GetPropertyStr(ctx, val, "z"));
 			break;
 	}
 
-	update_object_space(&ro->obj);
+	update_object_space(js_ro_data(ro));
 
     return JS_UNDEFINED;
 }
@@ -1451,14 +1385,14 @@ static JSValue athena_ro_get_bone_transform(JSContext *ctx, JSValue this_val, in
 	if (!ro)
 		return JS_EXCEPTION;
 
-	if (!ro->obj.data || !ro->obj.data->skeleton || !ro->obj.bones)
+	if (!js_ro_data(ro)->data || !js_ro_data(ro)->data->skeleton || !js_ro_data(ro)->bones)
 		return JS_UNDEFINED;
 
 	const char *name = JS_ToCString(ctx, argv[0]);
 	if (!name)
 		return JS_EXCEPTION;
 
-	athena_skeleton *skeleton = ro->obj.data->skeleton;
+	athena_skeleton *skeleton = js_ro_data(ro)->data->skeleton;
 	int bone_id = -1;
 
 	for (int i = 0; i < skeleton->bone_count; i++) {
@@ -1478,22 +1412,22 @@ static JSValue athena_ro_get_bone_transform(JSContext *ctx, JSValue this_val, in
 
 	// World-space transform matrix
 	JSValue bone_matrix = JS_NewObjectClass(ctx, get_matrix4_class_id());
-	JS_SetOpaque(bone_matrix, &ro->obj.bone_matrices[bone_id]);
+	JS_SetOpaque(bone_matrix, &js_ro_data(ro)->bone_matrices[bone_id]);
 	JS_DefinePropertyValueStr(ctx, result, "matrix", bone_matrix, JS_PROP_C_W_E);
 
 	// Local-space position
 	JSValue pos = JS_NewObject(ctx);
-	JS_DefinePropertyValueStr(ctx, pos, "x", JS_NewFloat32(ctx, ro->obj.bones[bone_id].position[0]), JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, pos, "y", JS_NewFloat32(ctx, ro->obj.bones[bone_id].position[1]), JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, pos, "z", JS_NewFloat32(ctx, ro->obj.bones[bone_id].position[2]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, pos, "x", JS_NewFloat32(ctx, js_ro_data(ro)->bones[bone_id].position[0]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, pos, "y", JS_NewFloat32(ctx, js_ro_data(ro)->bones[bone_id].position[1]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, pos, "z", JS_NewFloat32(ctx, js_ro_data(ro)->bones[bone_id].position[2]), JS_PROP_C_W_E);
 	JS_DefinePropertyValueStr(ctx, result, "position", pos, JS_PROP_C_W_E);
 
 	// Local-space rotation (quaternion)
 	JSValue rot = JS_NewObject(ctx);
-	JS_DefinePropertyValueStr(ctx, rot, "x", JS_NewFloat32(ctx, ro->obj.bones[bone_id].rotation[0]), JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, rot, "y", JS_NewFloat32(ctx, ro->obj.bones[bone_id].rotation[1]), JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, rot, "z", JS_NewFloat32(ctx, ro->obj.bones[bone_id].rotation[2]), JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, rot, "w", JS_NewFloat32(ctx, ro->obj.bones[bone_id].rotation[3]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, rot, "x", JS_NewFloat32(ctx, js_ro_data(ro)->bones[bone_id].rotation[0]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, rot, "y", JS_NewFloat32(ctx, js_ro_data(ro)->bones[bone_id].rotation[1]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, rot, "z", JS_NewFloat32(ctx, js_ro_data(ro)->bones[bone_id].rotation[2]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, rot, "w", JS_NewFloat32(ctx, js_ro_data(ro)->bones[bone_id].rotation[3]), JS_PROP_C_W_E);
 	JS_DefinePropertyValueStr(ctx, result, "rotation", rot, JS_PROP_C_W_E);
 
 	// Bone index
@@ -1503,7 +1437,7 @@ static JSValue athena_ro_get_bone_transform(JSContext *ctx, JSValue this_val, in
 }
 
 static const JSCFunctionListEntry js_render_object_proto_funcs[] = {
-    JS_CFUNC_DEF("render",        0,  athena_drawobject),
+    JS_CFUNC_DEF("render",        0,  js_drawobject),
 	JS_CFUNC_DEF("renderBounds",  0,    athena_drawbbox),
 	JS_CFUNC_DEF("free",  0,    athena_drawfree),
 	JS_CFUNC_DEF("dispose",  0,    athena_drawfree),
@@ -1533,8 +1467,8 @@ static void render_batch_free(JSRuntime *rt, JSValue val) {
         JS_FreeValueRT(rt, jb->refs[i]);
     }
     free(jb->refs);
-    if (jb->batch)
-        athena_batch_destroy(jb->batch);
+    if (jb->native)
+        athena_render_batch_destroy(jb->native);
     js_free_rt(rt, jb);
     JS_SetOpaque(val, NULL);
 }
@@ -1557,29 +1491,29 @@ static int render_batch_ensure(JSContext *ctx, JSRenderBatch *batch, uint32_t ex
 
 static JSValue athena_render_batch_ctor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
     JSRenderBatch *jb = js_mallocz(ctx, sizeof(JSRenderBatch));
+    int auto_sort = 1;
+
     if (!jb)
         return JS_EXCEPTION;
 
-    jb->batch = athena_batch_create();
-    if (!jb->batch) {
-        js_free(ctx, jb);
-        return JS_EXCEPTION;
-    }
-
-    int auto_sort = 1;
     if (argc > 0 && JS_IsObject(argv[0])) {
         JSValue auto_sort_val = JS_GetPropertyStr(ctx, argv[0], "autoSort");
         if (!JS_IsUndefined(auto_sort_val))
             auto_sort = JS_ToBool(ctx, auto_sort_val);
         JS_FreeValue(ctx, auto_sort_val);
     }
-    athena_batch_set_sort(jb->batch, NULL, auto_sort);
+
+    jb->native = athena_render_batch_create(auto_sort);
+    if (!jb->native) {
+        js_free(ctx, jb);
+        return JS_EXCEPTION;
+    }
 
     JSValue proto = JS_GetPropertyStr(ctx, new_target, "prototype");
     JSValue obj = JS_NewObjectProtoClass(ctx, proto, js_render_batch_class_id);
     JS_FreeValue(ctx, proto);
     if (JS_IsException(obj)) {
-        athena_batch_destroy(jb->batch);
+        athena_render_batch_destroy(jb->native);
         js_free(ctx, jb);
         return obj;
     }
@@ -1599,13 +1533,13 @@ static JSValue athena_render_batch_add(JSContext *ctx, JSValueConst this_val, in
     if (!ro)
         return JS_EXCEPTION;
 
-    if (athena_batch_add(jb->batch, &ro->obj) < 0)
+    if (athena_render_batch_add(jb->native, ro->native) < 0)
         return JS_ThrowInternalError(ctx, "batch add failed");
 
     if (render_batch_ensure(ctx, jb, 1) != 0)
         return JS_ThrowInternalError(ctx, "out of memory");
     jb->refs[jb->ref_count++] = JS_DupValue(ctx, argv[0]);
-    return JS_NewUint32(ctx, jb->batch->count);
+    return JS_NewUint32(ctx, athena_render_batch_size(jb->native));
 }
 
 static JSValue athena_render_batch_clear(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -1617,17 +1551,15 @@ static JSValue athena_render_batch_clear(JSContext *ctx, JSValueConst this_val, 
         JS_FreeValue(ctx, jb->refs[i]);
     }
     jb->ref_count = 0;
-    athena_batch_clear(jb->batch);
+    athena_render_batch_clear(jb->native);
     return JS_UNDEFINED;
 }
-
-/* render_batch_compare no longer used (sorting handled in C core) */
 
 static JSValue athena_render_batch_render(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     JSRenderBatch *jb = JS_GetOpaque2(ctx, this_val, js_render_batch_class_id);
     if (!jb)
         return JS_EXCEPTION;
-    unsigned int n = athena_batch_render(jb->batch);
+    unsigned int n = athena_render_batch_render(jb->native);
     return JS_NewUint32(ctx, n);
 }
 
@@ -1635,7 +1567,7 @@ static JSValue athena_render_batch_size(JSContext *ctx, JSValueConst this_val, i
     JSRenderBatch *jb = JS_GetOpaque2(ctx, this_val, js_render_batch_class_id);
     if (!jb)
         return JS_EXCEPTION;
-    return JS_NewUint32(ctx, jb->batch->count);
+    return JS_NewUint32(ctx, athena_render_batch_size(jb->native));
 }
 
 static JSValue athena_render_batch_free(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -1684,7 +1616,7 @@ static void scene_node_free(JSRuntime *rt, JSValue val) {
 	}
 
 	if (node->node)
-		athena_scene_node_destroy(node->node);
+		render_scene_node_destroy(node->node);
 	js_free_rt(rt, node);
 	JS_SetOpaque(val, NULL);
 }
@@ -1710,7 +1642,7 @@ static JSValue athena_scene_node_ctor(JSContext *ctx, JSValueConst new_target, i
 		return JS_EXCEPTION;
 
     node->ctx = ctx;
-    node->node = athena_scene_node_create();
+    node->node = render_scene_node_create();
     if (!node->node) {
         js_free(ctx, node);
         return JS_EXCEPTION;
@@ -1739,7 +1671,7 @@ static void scene_node_detach_parent(JSContext *ctx, JSSceneNode *node, JSValue 
     if (parent) {
         js_value_list_remove(ctx, &parent->children, node_val);
         if (parent->node)
-            athena_scene_node_remove_child(parent->node, node->node);
+            render_scene_node_remove_child(parent->node, node->node);
     }
 	JS_FreeValue(ctx, node->parent);
 	node->parent = JS_UNDEFINED;
@@ -1763,7 +1695,7 @@ static JSValue js_scene_node_add_child(JSContext *ctx, JSValueConst this_val, in
     if (js_value_list_push(ctx, &node->children, argv[0]) != 0)
         return JS_ThrowInternalError(ctx, "out of memory");
 
-    athena_scene_node_add_child(node->node, child->node);
+    render_scene_node_add_child(node->node, child->node);
     child->parent = JS_DupValue(ctx, this_val);
 	return JS_NewUint32(ctx, node->children.count);
 }
@@ -1784,7 +1716,7 @@ static JSValue js_scene_node_remove_child(JSContext *ctx, JSValueConst this_val,
         JS_FreeValue(ctx, child->parent);
         child->parent = JS_UNDEFINED;
     }
-    athena_scene_node_remove_child(node->node, child->node);
+    render_scene_node_remove_child(node->node, child->node);
     return JS_NewUint32(ctx, node->children.count);
 }
 
@@ -1802,7 +1734,7 @@ static JSValue js_scene_node_attach(JSContext *ctx, JSValueConst this_val, int a
 	js_value_list_remove(ctx, &node->attachments, argv[0]);
 	if (js_value_list_push(ctx, &node->attachments, argv[0]) != 0)
 		return JS_ThrowInternalError(ctx, "out of memory");
-	athena_scene_node_attach(node->node, &ro->obj);
+	render_scene_node_attach(node->node, js_ro_data(ro));
 	return JS_NewUint32(ctx, node->attachments.count);
 }
 
@@ -1814,14 +1746,14 @@ static JSValue js_scene_node_detach(JSContext *ctx, JSValueConst this_val, int a
 	if (argc == 0) {
 		js_value_list_free(ctx, &node->attachments);
 		js_value_list_init(&node->attachments);
-		athena_scene_node_detach(node->node, NULL);
+		render_scene_node_detach(node->node, NULL);
 		return JS_NewUint32(ctx, 0);
 	}
 
 	JSRenderObject *ro = JS_GetOpaque2(ctx, argv[0], js_render_object_class_id);
 	js_value_list_remove(ctx, &node->attachments, argv[0]);
 	if (ro)
-		athena_scene_node_detach(node->node, &ro->obj);
+		render_scene_node_detach(node->node, js_ro_data(ro));
 	return JS_NewUint32(ctx, node->attachments.count);
 }
 
@@ -1893,7 +1825,7 @@ static JSValue athena_scene_node_update(JSContext *ctx, JSValueConst this_val, i
     if (!node)
         return JS_EXCEPTION;
 
-    athena_scene_update(node->node);
+    render_scene_update(node->node);
     return JS_UNDEFINED;
 }
 
@@ -1932,7 +1864,7 @@ static void render_async_loader_free(JSRuntime *rt, JSValue val) {
         return;
     if (loader->native) {
         // Cleanup any pending thunks before destroying the native loader
-        athena_async_clear_with(loader->native, loader_thunk_cleanup_rt);
+        athena_async_loader_clear_with(loader->native, loader_thunk_cleanup_rt);
         athena_async_loader_destroy(loader->native);
     }
     js_free_rt(rt, loader);
@@ -1992,7 +1924,7 @@ static JSValue athena_render_async_loader_enqueue(JSContext *ctx, JSValueConst t
 
     GSSURFACE *tex_ptr = NULL;
     if (!JS_IsUndefined(texture) && !JS_IsNull(texture)) {
-        JSImageData* image = JS_GetOpaque2(ctx, texture, get_img_class_id());
+        AthenaImage* image = JS_GetOpaque2(ctx, texture, get_img_class_id());
         if (image)
             tex_ptr = image->tex;
     }
@@ -2006,7 +1938,7 @@ static JSValue athena_render_async_loader_enqueue(JSContext *ctx, JSValueConst t
     thunk->cb = JS_DupValue(ctx, callback);
     thunk->path_c = strdup(cpath);
 
-    int qsz = athena_async_enqueue(loader->native, cpath, tex_ptr, loader_bridge_cb, thunk);
+    int qsz = athena_async_loader_enqueue(loader->native, cpath, tex_ptr, loader_bridge_cb, thunk);
     JS_FreeCString(ctx, cpath);
     if (qsz < 0) {
         JS_FreeValue(ctx, thunk->cb);
@@ -2021,7 +1953,7 @@ static JSValue athena_render_async_loader_clear(JSContext *ctx, JSValueConst thi
     JSRenderAsyncLoader *loader = JS_GetOpaque2(ctx, this_val, js_render_async_loader_class_id);
     if (!loader)
         return JS_EXCEPTION;
-    athena_async_clear_with(loader->native, loader_thunk_cleanup_js);
+    athena_async_loader_clear_with(loader->native, loader_thunk_cleanup_js);
     return JS_UNDEFINED;
 }
 
@@ -2037,22 +1969,22 @@ static JSValue athena_render_async_loader_process(JSContext *ctx, JSValueConst t
         JS_ToUint32(ctx, &budget, argv[0]);
         if (budget == 0) budget = loader->jobs_per_step;
     }
-    unsigned int qsz_before = athena_async_queue_size(loader->native);
-    unsigned int processed = athena_async_process(loader->native, budget);
-    unsigned int qsz_after = athena_async_queue_size(loader->native);
+    unsigned int qsz_before = athena_async_loader_queue_size(loader->native);
+    unsigned int processed = athena_async_loader_process(loader->native, budget);
+    unsigned int qsz_after = athena_async_loader_queue_size(loader->native);
     return JS_NewUint32(ctx, processed);
 }
 
 static JSValue athena_render_async_loader_size(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     JSRenderAsyncLoader *loader = JS_GetOpaque2(ctx, this_val, js_render_async_loader_class_id);
     if (!loader) return JS_EXCEPTION;
-    return JS_NewUint32(ctx, athena_async_queue_size(loader->native));
+    return JS_NewUint32(ctx, athena_async_loader_queue_size(loader->native));
 }
 
 static JSValue athena_render_async_loader_get_jps(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     JSRenderAsyncLoader *loader = JS_GetOpaque2(ctx, this_val, js_render_async_loader_class_id);
     if (!loader) return JS_EXCEPTION;
-    return JS_NewUint32(ctx, athena_async_jobs_per_step(loader->native));
+    return JS_NewUint32(ctx, athena_async_loader_jobs_per_step(loader->native));
 }
 
 static JSValue athena_render_async_loader_set_jps(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -2060,7 +1992,7 @@ static JSValue athena_render_async_loader_set_jps(JSContext *ctx, JSValueConst t
     if (!loader) return JS_EXCEPTION;
     uint32_t v = loader->jobs_per_step;
     if (argc > 0) JS_ToUint32(ctx, &v, argv[0]);
-    athena_async_set_jobs_per_step(loader->native, v);
+    athena_async_loader_set_jobs_per_step(loader->native, v);
     loader->jobs_per_step = v ? v : 1;
     return JS_NewUint32(ctx, loader->jobs_per_step);
 }
@@ -2069,7 +2001,7 @@ static JSValue athena_render_async_loader_destroy(JSContext *ctx, JSValueConst t
     JSRenderAsyncLoader *loader = JS_GetOpaque2(ctx, this_val, js_render_async_loader_class_id);
     if (!loader) return JS_EXCEPTION;
     if (loader->native) {
-        athena_async_clear_with(loader->native, loader_thunk_cleanup_js);
+        athena_async_loader_clear_with(loader->native, loader_thunk_cleanup_js);
         athena_async_loader_destroy(loader->native);
         loader->native = NULL;
     }
@@ -2128,17 +2060,17 @@ static int js_render_async_loader_init(JSContext *ctx, JSModuleDef *m)
 }
 
 
-static JSValue athena_r_init(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
-  	render_init();
+static JSValue js_r_init(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
+  	athena_render_module_init();
 	return JS_UNDEFINED;
 }
 
-static JSValue athena_r_begin(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
-  	render_begin();
+static JSValue js_r_begin(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
+  	athena_render_module_begin();
 	return JS_UNDEFINED;
 }
 
-static JSValue athena_set_view(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
+static JSValue js_set_view(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
 	float fov = 60.0f, near = 1.0f, far = 2000.0f, width = 0.0f, height = 0.0f;
 
 	if (argc > 0) {
@@ -2155,7 +2087,7 @@ static JSValue athena_set_view(JSContext *ctx, JSValue this_val, int argc, JSVal
 		}
 	}
 
-  	render_set_view(fov, near, far, width, height);
+  	athena_render_module_set_view(fov, near, far, width, height);
 	return JS_UNDEFINED;
 }
 
@@ -2226,8 +2158,8 @@ static JSValue athena_newvertex(JSContext *ctx, JSValue this_val, int argc, JSVa
 	return obj;
 }
 
-static JSValue athena_render_stats(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
-	const render_stats_t *stats = render_get_stats();
+static JSValue js_render_stats(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
+	const render_stats_t *stats = athena_render_module_get_stats();
 	JSValue obj = JS_NewObject(ctx);
 
 	JS_DefinePropertyValueStr(ctx, obj, "drawCalls", JS_NewUint32(ctx, stats->draw_calls), JS_PROP_C_W_E);
@@ -2236,17 +2168,17 @@ static JSValue athena_render_stats(JSContext *ctx, JSValue this_val, int argc, J
 	return obj;
 }
 
-static JSValue athena_render_reset_stats(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
-	render_reset_stats();
+static JSValue js_render_reset_stats(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
+	athena_render_module_reset_stats();
 	return JS_UNDEFINED;
 }
 
 static const JSCFunctionListEntry render_funcs[] = {
-	JS_CFUNC_DEF( "init",            0,                athena_r_init),
-	JS_CFUNC_DEF( "begin",            0,               athena_r_begin),
-    JS_CFUNC_DEF( "setView",         6,                athena_set_view),
-	JS_CFUNC_DEF( "stats",           0,                athena_render_stats),
-	JS_CFUNC_DEF( "resetStats",      0,                athena_render_reset_stats),
+	JS_CFUNC_DEF( "init",            0,                js_r_init),
+	JS_CFUNC_DEF( "begin",            0,               js_r_begin),
+    JS_CFUNC_DEF( "setView",         6,                js_set_view),
+	JS_CFUNC_DEF( "stats",           0,                js_render_stats),
+	JS_CFUNC_DEF( "resetStats",      0,                js_render_reset_stats),
 	JS_CFUNC_DEF( "vertexList",      6,                 athena_newvertex),
 	JS_CFUNC_DEF( "materialColor",   3,             athena_materialcolor),
 	JS_CFUNC_DEF( "material",        0,               athena_newmaterial),

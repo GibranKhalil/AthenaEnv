@@ -6,8 +6,6 @@
 #include <string.h>
 #include <stdbool.h>
 
-#include <ath_env.h>
-
 #include <taskman.h>
 #include <memory.h>
 #include <ee_tools.h>

@@ -45,6 +45,9 @@
 
 #include <graphics.h>
 #include <ath_env.h>
+#ifdef ATHENA_GRAPHICS
+#include <athena/screen.h>
+#endif
 
 #include "cutils.h"
 #include "list.h"
@@ -3608,7 +3611,6 @@ void js_std_promise_rejection_tracker(JSContext *ctx, JSValueConst promise,
 
 static JSValueConst render_loop_func = JS_UNDEFINED;
 static JSValueConst global_obj_ref = JS_UNDEFINED;
-static uint64_t clear_color = GS_SETREG_RGBAQ(0x00, 0x00, 0x00, 0x80, 0x00);
 
 void js_set_render_loop_func(JSContext *ctx, JSValueConst func) {
     if (func == JS_UNDEFINED || func == JS_NULL) {
@@ -3620,7 +3622,7 @@ void js_set_render_loop_func(JSContext *ctx, JSValueConst func) {
 }
 
 void js_set_clear_color(uint64_t color) {
-    clear_color = color;
+    athena_screen_set_clear_color((Color)color);
 }
 
 typedef struct {
@@ -3701,7 +3703,7 @@ int js_std_loop(JSContext *ctx)
         }
 
         if (render_loop_func != JS_UNDEFINED) {
-            clearScreen(clear_color);
+            clearScreen(athena_screen_get_clear_color());
             ret = JS_Call(ctx, render_loop_func, JS_UNDEFINED, 0, NULL);
             flipScreen();
 
