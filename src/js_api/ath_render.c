@@ -227,14 +227,14 @@ static JSValue athena_render_data_ctor(JSContext *ctx, JSValueConst new_target, 
     if (!ro)
         return JS_EXCEPTION;
 
+	// js_mallocz already zeroed the struct; only vertex_buffers need a non-zero
+	// (UNDEFINED) initial tag so the finalizer can tell which slots hold real refs.
 	for (int i = 0; i < 4; i++) {
 		ro->vertex_buffers[i] = JS_UNDEFINED;
 		ro->native.owns_vertices[i] = true;
 	}
 
 	if (JS_IsObject(argv[0])) {
-		memset(ro, 0, sizeof(JSRenderData));
-
 		JSValue vert_arr, ta_buf;
 		bool share_buffers = false;
 		
@@ -2094,50 +2094,54 @@ static JSValue js_set_view(JSContext *ctx, JSValue this_val, int argc, JSValueCo
 static JSValue athena_newmaterial(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
 	JSValue obj = JS_NewObject(ctx);
 
-	JS_DefinePropertyValueStr(ctx, obj, "ambient",             argv[0], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "diffuse",             argv[1], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "specular",            argv[2], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "emission",            argv[3], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "transmittance",       argv[4], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "shininess",           argv[5], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "refraction",          argv[6], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "transmission_filter", argv[7], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "disolve",             argv[8], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "texture_id",          argv[9], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "bump_texture_id",          argv[10], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "ref_texture_id",          argv[11], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "decal_texture_id",          argv[12], JS_PROP_C_W_E);
+	// argv[] are borrowed references; dup before storing so JS_DefinePropertyValue
+	// doesn't steal a reference owned by the caller (would cause a refcount underflow).
+	JS_DefinePropertyValueStr(ctx, obj, "ambient",             JS_DupValue(ctx, argv[0]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "diffuse",             JS_DupValue(ctx, argv[1]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "specular",            JS_DupValue(ctx, argv[2]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "emission",            JS_DupValue(ctx, argv[3]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "transmittance",       JS_DupValue(ctx, argv[4]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "shininess",           JS_DupValue(ctx, argv[5]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "refraction",          JS_DupValue(ctx, argv[6]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "transmission_filter", JS_DupValue(ctx, argv[7]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "disolve",             JS_DupValue(ctx, argv[8]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "texture_id",          JS_DupValue(ctx, argv[9]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "bump_texture_id",     JS_DupValue(ctx, argv[10]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "ref_texture_id",      JS_DupValue(ctx, argv[11]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "decal_texture_id",    JS_DupValue(ctx, argv[12]), JS_PROP_C_W_E);
 
 	return obj;
 }
 
 static JSValue athena_newmaterialindex(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
 	JSValue obj = JS_NewObject(ctx);
-	JS_DefinePropertyValueStr(ctx, obj, "index", argv[0], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "end",   argv[1], JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "index", JS_DupValue(ctx, argv[0]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "end",   JS_DupValue(ctx, argv[1]), JS_PROP_C_W_E);
 
 	return obj;
 }
 
 static JSValue athena_materialcolor(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
 	JSValue obj = JS_NewObject(ctx);
-	JS_DefinePropertyValueStr(ctx, obj, "r", argv[0], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "g", argv[1], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "b", argv[2], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "a", (argc > 3? argv[3] : JS_NewFloat32(ctx, 1.0f)), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "r", JS_DupValue(ctx, argv[0]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "g", JS_DupValue(ctx, argv[1]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "b", JS_DupValue(ctx, argv[2]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "a", (argc > 3? JS_DupValue(ctx, argv[3]) : JS_NewFloat32(ctx, 1.0f)), JS_PROP_C_W_E);
 
 	return obj;
 }
 
 static JSValue athena_newvertex(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv) {
 	JSValue obj = JS_NewObject(ctx);
-	JS_DefinePropertyValueStr(ctx, obj, "positions",        argv[0], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "normals",          argv[1], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "texcoords",        argv[2], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "colors",           argv[3], JS_PROP_C_W_E);
+	// argv[] are borrowed references; dup before storing so the typed arrays/material
+	// arrays aren't freed prematurely once the caller's locals go out of scope.
+	JS_DefinePropertyValueStr(ctx, obj, "positions",        JS_DupValue(ctx, argv[0]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "normals",          JS_DupValue(ctx, argv[1]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "texcoords",        JS_DupValue(ctx, argv[2]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "colors",           JS_DupValue(ctx, argv[3]), JS_PROP_C_W_E);
 
-	JS_DefinePropertyValueStr(ctx, obj, "materials",        argv[4], JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "material_indices", argv[5], JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "materials",        JS_DupValue(ctx, argv[4]), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "material_indices", JS_DupValue(ctx, argv[5]), JS_PROP_C_W_E);
 
 	bool share_buffers = false;
 	if (argc > 6) {

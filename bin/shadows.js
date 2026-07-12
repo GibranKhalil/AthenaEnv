@@ -1,4 +1,4 @@
-// {"name": "Skinning demo", "author": "Daniel Santos", "version": "04072023", "icon": "render_icon.png", "file": "skinning.js"}
+// {"name": "Shadows demo", "author": "Daniel Santos", "version": "04072023", "icon": "render_icon.png", "file": "shadows.js"}
 
 const font = new Font("default");
 font.scale = 0.6f;
