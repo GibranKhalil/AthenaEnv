@@ -311,6 +311,11 @@
     NativeFuncEntry *pending_intrinsic_entry;  /* Function entry for C calls, NULL if none */
     IROp pending_intrinsic_op;                 /* IR opcode (IR_SQRT_F32, IR_ABS_F32, or IR_CALL_C_FUNC) */
     NativeType pending_intrinsic_elem_type;    /* Element type for dynamic array intrinsics */
+    bool pending_intrinsic_is_method;          /* True for arr.push()/str.slice()-style instance
+                                                 * methods, whose receiver is a real IR value the
+                                                 * op still needs - as opposed to Math.sqrt()-style
+                                                 * namespace calls, whose receiver is a throwaway
+                                                 * global-object placeholder that must be dropped. */
 
     /* Resolved-but-not-yet-called intrinsics, innermost last.
      *

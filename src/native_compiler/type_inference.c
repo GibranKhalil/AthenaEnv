@@ -349,7 +349,18 @@ static int infer_block_types(IRBasicBlock *block, NativeType *local_types,
             /* Unary operations */
             case IR_NEG_I32:
                 t1 = type_stack_pop(stack);
-                if (NATIVE_TYPE_IS_INT64(t1)) {
+                if (NATIVE_TYPE_IS_FLOAT(t1)) {
+                    /* Unary minus is decoded as IR_NEG_I32 regardless of operand
+                     * type (see OP_neg), exactly like the binary ops are decoded
+                     * as their _I32 forms - so it needs the same promotion the
+                     * binary case does via needs_float above. Without it, `-a`
+                     * on a float ran an integer negate over the float's bit
+                     * pattern: -3.25f came back as -1078984704, which is
+                     * literally -(bits of 3.25f). */
+                    instr->op = IR_NEG_F32;
+                    type_stack_push(stack, NATIVE_TYPE_FLOAT32);
+                    instr->type = NATIVE_TYPE_FLOAT32;
+                } else if (NATIVE_TYPE_IS_INT64(t1)) {
                     instr->op = IR_NEG_I64;
                     type_stack_push(stack, NATIVE_TYPE_INT64);
                     instr->type = NATIVE_TYPE_INT64;
@@ -359,11 +370,51 @@ static int infer_block_types(IRBasicBlock *block, NativeType *local_types,
                 }
                 break;
                 
+            /* Math.* intrinsics that the decoder folds into a single IR op.
+             * All of these were missing here, so any block containing one was
+             * rejected by this pass ("default: return -1") and re-run through
+             * the permissive fallback below - which leaves the type stack
+             * unbalanced. Most survived by accident because their codegen
+             * hardcodes the right PUSH_TYPE, but Math.imul() came back as 0.
+             * Grouped by arity: pop N, push one result. */
             case IR_NEG_F32:
             case IR_SQRT_F32:
+            case IR_ABS_F32:
+            case IR_SIGN_F32:
+            case IR_FROUND_F32:
+            case IR_SATURATE_F32:
+            case IR_RSQRT_F32:
                 t1 = type_stack_pop(stack);
                 type_stack_push(stack, NATIVE_TYPE_FLOAT32);
                 instr->type = NATIVE_TYPE_FLOAT32;
+                break;
+
+            case IR_MIN_F32:
+            case IR_MAX_F32:
+            case IR_STEP_F32:
+                t1 = type_stack_pop(stack);
+                t2 = type_stack_pop(stack);
+                (void)t1; (void)t2;
+                type_stack_push(stack, NATIVE_TYPE_FLOAT32);
+                instr->type = NATIVE_TYPE_FLOAT32;
+                break;
+
+            case IR_CLAMP_F32:
+            case IR_FMA_F32:
+            case IR_LERP_F32:
+            case IR_SMOOTHSTEP_F32:
+                type_stack_pop(stack);
+                type_stack_pop(stack);
+                type_stack_pop(stack);
+                type_stack_push(stack, NATIVE_TYPE_FLOAT32);
+                instr->type = NATIVE_TYPE_FLOAT32;
+                break;
+
+            case IR_IMUL_I32:
+                type_stack_pop(stack);
+                type_stack_pop(stack);
+                type_stack_push(stack, NATIVE_TYPE_INT32);
+                instr->type = NATIVE_TYPE_INT32;
                 break;
                 
             /* Bitwise operations */
@@ -791,10 +842,35 @@ int infer_types(IRFunction *ir, const NativeFuncSignature *sig) {
                     case IR_LOAD_ARRAY:
                         if (stack.depth >= 2) {
                             type_stack_pop(&stack);  /* index */
-                            type_stack_pop(&stack);  /* array */
-                            type_stack_push(&stack, NATIVE_TYPE_INT32);  /* Assume int32 */
-                            instr->type = NATIVE_TYPE_INT32;
+                            NativeType arr_t = type_stack_pop(&stack);  /* array */
+                            /* [reg] this used to blindly assume int32 regardless
+                             * of the array's real element type. A struct's
+                             * array field (e.g. `m.m[0]` on a float[16] field)
+                             * pushes its element via IR_LOAD_FIELD_ADDR, so the
+                             * popped type here is a real FLOAT32_ARRAY, not
+                             * UNKNOWN - ignoring it forced every such read to
+                             * be treated as int32, which made the codegen
+                             * numerically convert the raw float bit pattern as
+                             * if it were an integer (CVT.S.W on already-float
+                             * bits) instead of loading it as a float. */
+                            NativeType elem = native_array_element_type(arr_t);
+                            if (elem == NATIVE_TYPE_UNKNOWN) elem = NATIVE_TYPE_INT32;
+                            type_stack_push(&stack, elem);
+                            instr->type = elem;
                         }
+                        break;
+                    case IR_LOAD_FIELD:
+                    case IR_LOAD_FIELD_ADDR:
+                        /* [reg] these two fell through to `default` below,
+                         * which stomped the already-correct type (computed at
+                         * IR-construction time from the struct field's
+                         * declared type) back to UNKNOWN. Preserve it instead -
+                         * mirrors the strict pass at infer_block_types. */
+                        type_stack_push(&stack, instr->type);
+                        break;
+                    case IR_STORE_FIELD:
+                        if (stack.depth > 0) type_stack_pop(&stack);
+                        instr->type = NATIVE_TYPE_VOID;
                         break;
                     case IR_STORE_ARRAY:
                         if (stack.depth >= 3) {
@@ -1019,7 +1095,12 @@ size_t native_type_size(NativeType type) {
         case NATIVE_TYPE_INT32_ARRAY:
         case NATIVE_TYPE_UINT32_ARRAY:
         case NATIVE_TYPE_FLOAT32_ARRAY:
-            return sizeof(void*);  /* Pointer size */
+        case NATIVE_TYPE_DYNAMIC_INT32_ARRAY:
+        case NATIVE_TYPE_DYNAMIC_UINT32_ARRAY:
+        case NATIVE_TYPE_DYNAMIC_FLOAT32_ARRAY:
+        case NATIVE_TYPE_STRING:
+        case NATIVE_TYPE_STRING_VIEW:
+            return sizeof(void*);  /* All handles/views are a single pointer */
         case NATIVE_TYPE_VOID:
         case NATIVE_TYPE_UNKNOWN:
         default:

@@ -63,13 +63,13 @@ EE_LIBS = -L$(PS2SDK)/ports/lib -lmc -lpad -lmtap -lpatches -lz -llzma -lzip -lf
 
 EE_INCS += -I$(PS2SDK)/ports/include -I$(PS2SDK)/ports/include/zlib -Isrc/readini/include -Isrc/include -Isrc/include/athena -Isrc/js_api
 
-EE_CFLAGS +=  -Wall -fpermissive -DCONFIG_BIGNUM -DCONFIG_VERSION=\"$(shell cat VERSION)\" -D__TM_GMTOFF=tm_gmtoff -DPATH_MAX=256 -DPS2
+EE_CFLAGS +=  -Wall -fpermissive -DCONFIG_VERSION=\"$(shell cat VERSION)\" -D__TM_GMTOFF=tm_gmtoff -DPATH_MAX=256 -DPS2
 
 ifeq ($(DEBUG),1)
   EE_CFLAGS += -DDEBUG
 endif
 
-JS_CORE = quickjs/cutils.o quickjs/libbf.o quickjs/libregexp.o quickjs/libunicode.o \
+JS_CORE = quickjs/cutils.o quickjs/libregexp.o quickjs/libunicode.o \
 				 quickjs/realpath.o quickjs/quickjs.o quickjs/quickjs-libc.o
 
 VU1_MPGS = draw_3D_colors.o \

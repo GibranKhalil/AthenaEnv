@@ -33,7 +33,7 @@ extern JSClassID js_struct_class_id;
  * hang pinpoints the culprit. Off by default - it prints several lines per
  * compiled function, which drowns out a program's own output. */
 #ifndef NC_TRACE
-#define NC_TRACE 0
+#define NC_TRACE 1
 #endif
 
 #if NC_TRACE
@@ -266,8 +266,11 @@ const char *op_to_cstr(int op)
         [OP_xor]                    = "OP_xor",
         [OP_or]                     = "OP_or",
         [OP_is_undefined_or_null]   = "OP_is_undefined_or_null",
+#ifdef CONFIG_BIGNUM
+        /* Only emitted by QuickJS when bignum support is compiled in. */
         [OP_mul_pow10]              = "OP_mul_pow10",
         [OP_math_mod]               = "OP_math_mod",
+#endif
         [OP_nop]                    = "OP_nop",
         [OP_push_minus1]            = "OP_push_minus1",
         [OP_push_0]                 = "OP_push_0",
@@ -879,7 +882,12 @@ void ir_emit_jump_if(IRFunction *ir, int block, IROp op, int target) {
     instr.operand.label_id = target;
     ir_emit(ir, block, &instr);
     ir->blocks[block].successors[0] = target;
-    ir->blocks[block].successors[1] = block + 1;
+    /* successors[1] (the fallthrough) is deliberately NOT set here. Every
+     * caller creates its own fallthrough block and assigns it right after
+     * this returns. The old `block + 1` guess was only ever right by luck -
+     * the fallthrough block is not necessarily the next index once nested
+     * if/else bodies get numbered - and it silently overwrote a correct
+     * value at the one call site that assigned before calling. */
 }
 
 void ir_emit_return(IRFunction *ir, int block, NativeType type) {
@@ -2228,6 +2236,8 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 ir_emit_binop(ir_out, current_block, IR_MUL_I32);
                 break;
             }
+#ifdef CONFIG_BIGNUM
+            /* These two opcodes only exist in a bignum-enabled QuickJS. */
             case OP_mul_pow10: {
                 /* Multiply by power of 10 - not directly supported, use regular multiplication */
                 /* For now, treat as regular multiplication */
@@ -2240,6 +2250,7 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 ir_emit_binop(ir_out, current_block, IR_MOD_I32);
                 break;
             }
+#endif
             
             /* Bitwise operations */
             case OP_and: ir_emit_binop(ir_out, current_block, IR_AND); break;
@@ -2493,11 +2504,18 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 /* Force a new block for fallthrough */
                 int fallthrough = ir_create_block(ir_out);
                 
-                /* Set successors */
+                ir_emit_jump_if(ir_out, current_block, IR_JUMP_IF_TRUE, target);
+
+                /* Set successors AFTER the emit, like the other three branch
+                 * sites do. Setting them first meant ir_emit_jump_if's own
+                 * successors[1] = block + 1 default clobbered the real
+                 * fallthrough: for `if (x) continue;` inside a loop with a
+                 * large body, the continue target got block+1 while the body
+                 * was numbered later, so both successors pointed at the
+                 * continue target, the body block ended up with no incoming
+                 * edge at all, and ir_to_native emitted it as dead code. */
                 ir_out->blocks[current_block].successors[0] = target;
                 ir_out->blocks[current_block].successors[1] = fallthrough;
-                
-                ir_emit_jump_if(ir_out, current_block, IR_JUMP_IF_TRUE, target);
                 
                 /* Switch to fallthrough block */
                 current_block = fallthrough;
@@ -3063,7 +3081,8 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 nc->pending_intrinsic_op = IR_NOP;
                 nc->pending_intrinsic_entry = NULL;
                 nc->pending_intrinsic_elem_type = NATIVE_TYPE_UNKNOWN;
-                
+                nc->pending_intrinsic_is_method = false;
+
                 if (nc->js_ctx) {
                     const char *name = JS_AtomToCString(nc->js_ctx, (JSAtom)atom);
                     if (name) {
@@ -3105,6 +3124,12 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                                 nc->pending_intrinsic_op = IR_CALL_C_FUNC;
                                 nc->pending_intrinsic_entry = entry;
                             }
+                        } else {
+                            /* arr.push()/str.slice()-style instance method: the
+                             * receiver just loaded (a real local, not a global
+                             * placeholder) is the intrinsic's first operand and
+                             * must stay on the eval stack - see the DROP below. */
+                            nc->pending_intrinsic_is_method = true;
                         }
                         JS_FreeCString(nc->js_ctx, name);
                     }
@@ -3116,6 +3141,36 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                  * another one's arguments (Math.atan2(x, Math.sqrt(y))) doesn't
                  * clobber the outer one - see pending_intrinsic_stack. */
                 if (nc->pending_intrinsic_op != IR_NOP) {
+                    /* Drop the global-object placeholder that OP_get_var
+                     * pushed for `Math`. QuickJS's call_method pops the object
+                     * and the function along with the arguments, but we resolve
+                     * the callee at compile time and emit no IR for it - so
+                     * without this the placeholder was simply left behind.
+                     *
+                     * A single leftover sat harmlessly below the arguments, but
+                     * a nested call (Math.atan2(a, Math.sqrt(b))) left the
+                     * inner one BETWEEN the outer call's arguments: atan2 read
+                     * the placeholder 0 as its first argument and returned 0.
+                     * With Math.imul the leftover became a second return value
+                     * that overwrote the real one in $v0.
+                     *
+                     * [reg] arr.push()/str.slice()-style instance methods hit
+                     * this same "pending_intrinsic_op != IR_NOP" branch, but
+                     * their receiver isn't a placeholder - it's a real local
+                     * (arr) that IR_ARRAY_PUSH etc. still need to pop as their
+                     * first operand. Dropping it here desynced the eval-stack
+                     * accounting from the actual live values: the next
+                     * IR_LOAD_LOCAL reused the register the dropped receiver
+                     * was still sitting in (silently clobbering it), and the
+                     * intrinsic's second POP_REG() then underflowed the stack
+                     * index, picking up an unrelated, uninitialized register
+                     * as the "array" pointer - an Address Error on real
+                     * hardware the moment that garbage pointer got deref'd. */
+                    if (!nc->pending_intrinsic_is_method) {
+                        IRInstr drop = { .op = IR_DROP, .type = NATIVE_TYPE_VOID };
+                        ir_emit(ir_out, current_block, &drop);
+                    }
+
                     if (nc->pending_intrinsic_depth >= NC_MAX_PENDING_INTRINSICS) {
                         nc->has_error = true;
                         snprintf(nc->error_msg, sizeof(nc->error_msg),
@@ -3770,9 +3825,13 @@ static void allocate_locals(NativeCompiler *nc, const IRFunction *ir) {
             /* Allocate on stack ($s0-$s7 are reserved for the eval operand stack) */
             nc->local_regs[i] = -1;
             nc->local_stack_offs[i] = stack_slot;
-            
-            /* Determine size based on type */
+
+            /* Determine size based on type. Pointer-like types (string/array/ptr)
+             * report a size of 0 from native_type_size (see the matching clamp
+             * above for argument locals) - clamp here too so a string/array
+             * local doesn't share its stack slot with whatever comes next. */
             size_t size = native_type_size(ir->local_types[i]);
+            if (size < 4) size = 4;
             stack_slot += (size + 3) & ~3;  /* Align to 4 bytes */
         }
     }
@@ -5184,17 +5243,22 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             NativeType t1 = POP_TYPE();
             NativeType elem = instr->operand.field.field_type;
             void *pop_fn = nc_array_pop_fn(elem);
-            mips_addiu(em, REG_SP, REG_SP, -12);
-            mips_sw(em, REG_RA, 8, REG_SP);
+            /* [reg] this frame was -12, which desyncs $sp from the 8-byte
+             * alignment the MIPS N32 ABI requires at every call boundary
+             * (every other call site in this file uses -8). pop_fn is a
+             * GCC-compiled C function; a misaligned $sp faults the moment it
+             * does any 8-byte-aligned access relative to it. */
+            mips_addiu(em, REG_SP, REG_SP, -8);
+            mips_sw(em, REG_RA, 4, REG_SP);
             mips_addiu(em, REG_A1, REG_SP, 0);
             mips_move(em, REG_A0, r1);
             mips_lui(em, REG_T9, ((uint32_t)(uintptr_t)pop_fn >> 16) & 0xFFFF);
             mips_ori(em, REG_T9, REG_T9, (uint32_t)(uintptr_t)pop_fn & 0xFFFF);
             mips_jalr(em, REG_RA, REG_T9);
             mips_nop(em);
-            mips_lw(em, REG_RA, 8, REG_SP);
+            mips_lw(em, REG_RA, 4, REG_SP);
             mips_lw(em, REG_V0, 0, REG_SP);
-            mips_addiu(em, REG_SP, REG_SP, 12);
+            mips_addiu(em, REG_SP, REG_SP, 8);
             MipsReg dst = PUSH_REG();
             mips_move(em, dst, REG_V0);
             PUSH_TYPE(elem);
@@ -5597,6 +5661,27 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             break;
         }
         
+        /* Float negate (unary) - Native MIPS NEG.S.
+         * Unary minus decodes as IR_NEG_I32 and type inference promotes it to
+         * IR_NEG_F32 for float operands; without a case here that promotion
+         * turned into a hard "Unsupported IR opcode: 26" at codegen time. */
+        case IR_NEG_F32: {
+            MipsReg src = POP_REG();
+            NativeType src_type = POP_TYPE();
+
+            mips_mtc1(em, src, FPU_F0);
+            if (NATIVE_TYPE_IS_INT(src_type)) {
+                mips_cvt_s_w(em, FPU_F0, FPU_F0);
+            }
+            mips_neg_s(em, FPU_F0, FPU_F0);
+
+            MipsReg dst = PUSH_REG();
+            mips_mfc1(em, dst, FPU_F0);
+
+            PUSH_TYPE(NATIVE_TYPE_FLOAT32);
+            break;
+        }
+
         /* Float abs (unary) - Native MIPS ABS.S */
         case IR_ABS_F32: {
             MipsReg src = POP_REG();
@@ -5803,23 +5888,17 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
         
         /* Integer multiply (32-bit) - Uses MULT + MFLO */
         case IR_IMUL_I32: {
+            /* Same shape as IR_MUL_I32 above: MFLO straight into the stack
+             * register. This used to route the result through $v0 and then
+             * copy it out, which is both pointless and fragile - $v0 is the
+             * return register, not scratch - and Math.imul() came back 0. */
             MipsReg r2 = POP_REG();
             NativeType t2 = POP_TYPE(); (void)t2;
             MipsReg r1 = POP_REG();
             NativeType t1 = POP_TYPE(); (void)t1;
-            
-            /* MULT r1, r2 - result in HI:LO */
-            mips_mult(em, r1, r2);
-            
-            /* MFLO directly to $v0 for integer return */
-            mips_mflo(em, REG_V0);
-            
-            /* Push $v0 as result on stack */
             MipsReg dst = PUSH_REG();
-            if (dst != REG_V0) {
-                mips_move(em, dst, REG_V0);
-            }
-            
+            mips_mult(em, r1, r2);
+            mips_mflo(em, dst);
             PUSH_TYPE(NATIVE_TYPE_INT32);
             break;
         }
@@ -6711,8 +6790,17 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
                     mips_cvt_s_w(em, FPU_F0, FPU_F0);
                 }
             } else {
-                /* Integer return - value must go to $v0 */
-                if (val == REG_AT) {
+                /* Integer return - value must go to $v0.
+                 * Mirror of the float case above: if the value on the stack is
+                 * a float, moving it as-is hands the caller the raw bit
+                 * pattern. Returning 3.9f from an int-returning function used
+                 * to yield 1081711002, which is exactly bits(3.9f). Convert
+                 * numerically (truncating toward zero, like a JS int cast). */
+                if (NATIVE_TYPE_IS_FLOAT(val_type)) {
+                    mips_mtc1(em, val, FPU_F0);
+                    mips_cvt_w_s(em, FPU_F0, FPU_F0);
+                    mips_mfc1(em, REG_V0, FPU_F0);
+                } else if (val == REG_AT) {
                     MipsReg tmp = REG_T7;
                     mips_move(em, tmp, REG_AT);
                     mips_move(em, REG_V0, tmp);
@@ -7539,7 +7627,11 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
     }
     
     /* Dump generated assembly for debugging */
+#if NC_TRACE
+    /* Full disassembly of every compiled function - invaluable when chasing a
+     * miscompile, far too noisy otherwise. Build with -DNC_TRACE=1 to get it. */
     mips_emitter_dump(&nc->emitter, "Compiled Function");
+#endif
     
     /* Package result - The emitter now uses arena-style allocation:
      * Each function's code stays permanently in the buffer at its position.
@@ -7806,11 +7898,14 @@ JSValue native_func_call(JSContext *ctx, NativeFunc *func, int argc, JSValueCons
         int64_t result64 = int64_fn(args[0], args[1], args[2], args[3],
                                      args[4], args[5], args[6], args[7]);
         
-        /* Use BigInt for proper 64-bit representation */
+        /* Returned as a Number: BigInt went away with CONFIG_BIGNUM. Exact up
+         * to 2^53, lossy above that. The 64-bit multiply/divide/modulo this
+         * compiler emits are already emulated and lossy on the R5900 anyway
+         * (the CPU has no DMULT/DDIV), so 64-bit natives were never exact. */
         if (sig->return_type == NATIVE_TYPE_INT64) {
-            return JS_NewBigInt64(ctx, result64);
+            return JS_NewFloat64(ctx, (double)result64);
         } else {
-            return JS_NewBigUint64(ctx, (uint64_t)result64);
+            return JS_NewFloat64(ctx, (double)(uint64_t)result64);
         }
     }
     

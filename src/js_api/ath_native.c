@@ -7,6 +7,11 @@
  * to native MIPS R5900 code on PS2.
  */
 
+/* int64/uint64 cross the JS boundary as Numbers now that BigInt is gone
+ * along with CONFIG_BIGNUM. Exact up to 2^53; beyond that the low bits are
+ * lost. Nothing ships using 64-bit natives today, and the compiler's own
+ * 64-bit multiply/divide/modulo are already emulated and lossy on the
+ * R5900 (no DMULT/DDIV), so this does not regress anything that worked. */
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -476,10 +481,10 @@ static int js_struct_array_get_own_property(JSContext *ctx,
                 desc->value = JS_NewFloat64(ctx, *(float *)ptr);
                 break;
             case NATIVE_TYPE_INT64:
-                desc->value = JS_NewBigInt64(ctx, *(int64_t *)ptr);
+                desc->value = JS_NewFloat64(ctx, (double)*(int64_t *)ptr);
                 break;
             case NATIVE_TYPE_UINT64:
-                desc->value = JS_NewBigUint64(ctx, *(uint64_t *)ptr);
+                desc->value = JS_NewFloat64(ctx, (double)*(uint64_t *)ptr);
                 break;
             default:
                 desc->value = JS_UNDEFINED;
@@ -536,7 +541,10 @@ static int js_struct_array_set_property(JSContext *ctx, JSValueConst obj,
         }
         case NATIVE_TYPE_INT64: {
             int64_t v;
-            if (JS_ToBigInt64(ctx, &v, value) < 0) {
+            double dv;
+            if (JS_ToFloat64(ctx, &dv, value) == 0) {
+                v = (int64_t)dv;
+            } else {
                 int32_t v32;
                 if (JS_ToInt32(ctx, &v32, value) < 0) return -1;
                 v = v32;
@@ -546,7 +554,10 @@ static int js_struct_array_set_property(JSContext *ctx, JSValueConst obj,
         }
         case NATIVE_TYPE_UINT64: {
             int64_t v;
-            if (JS_ToBigInt64(ctx, &v, value) < 0) {
+            double dv;
+            if (JS_ToFloat64(ctx, &dv, value) == 0) {
+                v = (int64_t)(uint64_t)dv;
+            } else {
                 uint32_t v32;
                 if (JS_ToUint32(ctx, &v32, value) < 0) return -1;
                 v = (int64_t)v32;
@@ -627,9 +638,9 @@ static JSValue js_struct_get(JSContext *ctx, JSValueConst this_val, int magic) {
         case NATIVE_TYPE_FLOAT32:
             return JS_NewFloat64(ctx, *(float *)ptr);
         case NATIVE_TYPE_INT64:
-            return JS_NewBigInt64(ctx, *(int64_t *)ptr);
+            return JS_NewFloat64(ctx, (double)*(int64_t *)ptr);
         case NATIVE_TYPE_UINT64:
-            return JS_NewBigUint64(ctx, *(uint64_t *)ptr);
+            return JS_NewFloat64(ctx, (double)*(uint64_t *)ptr);
         default:
             return JS_UNDEFINED;
     }
@@ -666,7 +677,10 @@ static JSValue js_struct_set(JSContext *ctx, JSValueConst this_val, JSValueConst
         }
         case NATIVE_TYPE_INT64: {
             int64_t v;
-            if (JS_ToBigInt64(ctx, &v, val) < 0) {
+            double dv;
+            if (JS_ToFloat64(ctx, &dv, val) == 0) {
+                v = (int64_t)dv;
+            } else {
                 /* Fallback to int32 */
                 int32_t v32;
                 if (JS_ToInt32(ctx, &v32, val) < 0) return JS_EXCEPTION;
@@ -753,27 +767,21 @@ static JSValue js_struct_constructor(JSContext *ctx, JSValueConst new_target,
     
     /* Bind methods from func_data[1] if provided */
     JSValue methods_obj = func_data[1];
-    printf("[DEBUG] js_struct_constructor: methods_obj isObject=%d isUndefined=%d\n", 
-           JS_IsObject(methods_obj), JS_IsUndefined(methods_obj));
-    
+
     if (JS_IsObject(methods_obj)) {
         JSPropertyEnum *method_props = NULL;
         uint32_t method_count = 0;
-        
+
         if (JS_GetOwnPropertyNames(ctx, &method_props, &method_count, methods_obj,
                                     JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) >= 0) {
-            printf("[DEBUG] Found %u methods in methods_obj\n", method_count);
-            
             for (uint32_t i = 0; i < method_count; i++) {
                 JSValue method_val = JS_GetProperty(ctx, methods_obj, method_props[i].atom);
                 const char *method_name = JS_AtomToCString(ctx, method_props[i].atom);
-                printf("[DEBUG] Processing method: %s\n", method_name ? method_name : "???");
-                
+
                 /* Check for deferred compilation marker (has 'self' arg) */
                 JSValue is_deferred = JS_GetPropertyStr(ctx, method_val, "_deferred");
                 int deferred_bool = JS_ToBool(ctx, is_deferred);
-                printf("[DEBUG] Method %s: _deferred=%d\n", method_name ? method_name : "???", deferred_bool);
-                
+
                 if (deferred_bool) {
                     JS_FreeValue(ctx, is_deferred);
                     
@@ -802,13 +810,11 @@ static JSValue js_struct_constructor(JSContext *ctx, JSValueConst new_target,
                                 /* Create a pseudo-function object with _structDef property
                                  * that athena_native_compile can recognize as struct type */
                                 NativeStructDef *def = JS_GetOpaque(func_data[0], js_struct_def_class_id);
-                                printf("[DEBUG] Replacing 'self' with struct_ref, def=%p\n", (void*)def);
-                                
+
                                 JSValue struct_ref = JS_NewObject(ctx);
-                                JS_SetPropertyStr(ctx, struct_ref, "_structDef", 
+                                JS_SetPropertyStr(ctx, struct_ref, "_structDef",
                                                   JS_NewInt64(ctx, (int64_t)(uintptr_t)def));
-                                printf("[DEBUG] Created struct_ref with _structDef=%lld\n", (long long)(uintptr_t)def);
-                                
+
                                 /* Mark as function so JS_IsFunction check passes in athena_native_compile */
                                 arg = struct_ref;
                             }
@@ -828,22 +834,21 @@ static JSValue js_struct_constructor(JSContext *ctx, JSValueConst new_target,
                     /* Compile with proper signature (self -> ptr with struct def) */
                     JSValue compile_args[2] = { new_sig, orig_func };
                     JSValue compiled = js_native_compile(ctx, JS_UNDEFINED, 2, compile_args);
-                    printf("[DEBUG] Method %s: compilation %s\n", method_name ? method_name : "???",
-                           JS_IsException(compiled) ? "FAILED" : "SUCCESS");
-                    
+
                     JS_FreeValue(ctx, new_sig);
                     JS_FreeValue(ctx, orig_func);
                     
                     if (JS_IsException(compiled)) {
-                        /* Get exception message to debug */
+                        /* Report and skip: the struct still gets its fields, it
+                         * just won't carry this method. */
                         JSValue exception = JS_GetException(ctx);
                         const char *err_msg = JS_ToCString(ctx, exception);
-                        printf("[DEBUG ERROR] Compilation failed for %s: %s\n",
+                        printf("Native.struct: could not compile method '%s': %s\n",
                                method_name ? method_name : "???",
                                err_msg ? err_msg : "unknown error");
                         if (err_msg) JS_FreeCString(ctx, err_msg);
                         JS_FreeValue(ctx, exception);
-                        
+
                         if (method_name) JS_FreeCString(ctx, method_name);
                         continue;  /* Skip this method on error */
                     }
@@ -853,11 +858,9 @@ static JSValue js_struct_constructor(JSContext *ctx, JSValueConst new_target,
                     JSValue wrapper = JS_NewCFunctionData(ctx, 
                         (JSCFunctionData *)js_native_method_wrapper,
                         0, 0, 1, wrapper_data);
-                    printf("[DEBUG] Created wrapper for method %s\n", method_name ? method_name : "???");
-                    
+
                     JS_DefinePropertyValue(ctx, obj, method_props[i].atom,
                                           wrapper, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-                    printf("[DEBUG] Bound method %s to instance\n", method_name ? method_name : "???");
                 } else if (JS_IsFunction(ctx, method_val)) {
                     JS_FreeValue(ctx, is_deferred);
                     

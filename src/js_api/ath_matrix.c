@@ -176,6 +176,27 @@ static JSClassDef js_matrix4_class = {
     .exotic = &js_matrix4_exotic
 };
 
+/* Method forms of the overloaded operators. `*` and `==` used to be registered
+ * through Operators.create, which needs QuickJS's operator overloading - only
+ * available under CONFIG_BIGNUM, which also drags in BigInt/BigFloat/
+ * BigDecimal and libbf. As plain methods they need none of that. The binary
+ * helpers read both operands from argv, so the shims prepend `this`. */
+static JSValue js_matrix4_mul_method(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+    JSValueConst a[2];
+    a[0] = this_val;
+    a[1] = (argc > 0) ? argv[0] : JS_UNDEFINED;
+    return js_matrix4_mul(ctx, this_val, 2, a);
+}
+
+static JSValue js_matrix4_equals_method(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+    JSValueConst a[2];
+    a[0] = this_val;
+    a[1] = (argc > 0) ? argv[0] : JS_UNDEFINED;
+    return js_matrix4_eq(ctx, this_val, 2, a);
+}
+
 static const JSCFunctionListEntry js_matrix4_proto_funcs[] = {
     JS_CFUNC_DEF("toString", 0, js_matrix4_tostring),
     JS_CFUNC_DEF("toArray", 0, js_matrix4_toarray),
@@ -186,28 +207,9 @@ static const JSCFunctionListEntry js_matrix4_proto_funcs[] = {
     JS_CFUNC_DEF("invert", 0, js_matrix4_invert),
     JS_CFUNC_DEF("identity", 0, js_matrix4_identity),
     JS_PROP_INT32_DEF("length", ATHENA_MATRIX4_LENGTH, JS_PROP_CONFIGURABLE),
+    JS_CFUNC_DEF("mul", 1, js_matrix4_mul_method),
+    JS_CFUNC_DEF("equals", 1, js_matrix4_equals_method),
 };
-
-static void js_matrix4_init_operators(JSContext *ctx, JSValue proto) {
-    JSValue operatorSet, obj, global, Operators, Symbol, symbol_operatorSet;
-    global = JS_GetGlobalObject(ctx);
-    Symbol = JS_GetPropertyStr(ctx, global, "Symbol");
-    symbol_operatorSet = JS_GetPropertyStr(ctx, Symbol, "operatorSet");
-    JS_FreeValue(ctx, Symbol);
-    Operators = JS_GetPropertyStr(ctx, global, "Operators");
-    JS_FreeValue(ctx, global);
-    JSValue create_func = JS_GetPropertyStr(ctx, Operators, "create");
-    obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "*", JS_NewCFunction(ctx, js_matrix4_mul, "*", 2));
-    JS_SetPropertyStr(ctx, obj, "==", JS_NewCFunction(ctx, js_matrix4_eq, "==", 2));
-    JSValueConst args[1] = { obj };
-    operatorSet = JS_Call(ctx, create_func, Operators, 1, args);
-    JS_FreeValue(ctx, create_func);
-    JS_FreeValue(ctx, obj);
-    JS_FreeValue(ctx, Operators);
-    JS_SetProperty(ctx, proto, JS_ValueToAtom(ctx, symbol_operatorSet), operatorSet);
-    JS_FreeValue(ctx, symbol_operatorSet);
-}
 
 static int js_matrix4_init(JSContext *ctx, JSModuleDef *m) {
     JSValue matrix4_proto, matrix4_class;
@@ -218,7 +220,6 @@ static int js_matrix4_init(JSContext *ctx, JSModuleDef *m) {
     matrix4_class = JS_NewCFunction2(ctx, js_matrix4_ctor, "Matrix4", 16, JS_CFUNC_constructor_or_func, 0);
     JS_SetConstructor(ctx, matrix4_class, matrix4_proto);
     JS_SetClassProto(ctx, js_matrix4_class_id, matrix4_proto);
-    js_matrix4_init_operators(ctx, matrix4_proto);
     return JS_SetModuleExport(ctx, m, "Matrix4", matrix4_class);
 }
 
