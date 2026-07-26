@@ -530,15 +530,34 @@ static int infer_block_types(IRBasicBlock *block, NativeType *local_types,
                 instr->type = NATIVE_TYPE_VOID;
                 break;
                 
+            /* Direct call to a registered C function (Math.sin, Math.atan2,
+             * ...). Same shape as IR_CALL except the callee address is baked
+             * in, so there is no callee operand on the stack. Without this
+             * case the op fell through to `default: return -1`, which failed
+             * inference for the whole block and dropped it into the permissive
+             * fallback below - where the result of e.g. sinf() came back typed
+             * as int32, so every float op consuming it was emitted as integer
+             * arithmetic. */
+            case IR_CALL_C_FUNC:
             case IR_CALL:
-                /* Function calls - would need function signature info */
-                /* For now, assume returns int32 */
+            case IR_TAIL_CALL: {
+                /* bytecode_to_ir's nc_apply_pending_call_sig() stamps the
+                 * resolved callee's real return type onto operand.call.ret_type
+                 * when it can (i.e. the callee was a resolvable nested
+                 * Native.compile() function) - use that instead of blindly
+                 * assuming int32, or a float-returning nested call (e.g.
+                 * lerp/clamp) ends up read from $v0 instead of $f0. UNKNOWN
+                 * means we truly don't know (unresolved indirect call), so
+                 * int32 remains the fallback only in that case. */
                 for (int j = 0; j < instr->operand.call.arg_count; j++) {
                     type_stack_pop(stack);
                 }
-                type_stack_push(stack, NATIVE_TYPE_INT32);
-                instr->type = NATIVE_TYPE_INT32;
+                NativeType rt = instr->operand.call.ret_type;
+                if (rt == NATIVE_TYPE_UNKNOWN) rt = NATIVE_TYPE_INT32;
+                type_stack_push(stack, rt);
+                instr->type = rt;
                 break;
+            }
                 
             /* String operations */
             case IR_STRING_CONCAT: {
@@ -688,17 +707,56 @@ int infer_types(IRFunction *ir, const NativeFuncSignature *sig) {
         }
     }
     
+    /* Re-run the full block-by-block pass below until local_types[]
+     * stabilizes. A single pass processes blocks in index order
+     * (0,1,2,...), which doesn't match control-flow order: a local whose
+     * true type is only discovered via a promotion in a LATER block (e.g.
+     * a loop's else-branch storing a float result - see the promotion
+     * rule in IR_STORE_LOCAL below) leaves EARLIER blocks that already
+     * loaded that local - e.g. the same loop's body reading it a few
+     * instructions up to pass to a nested call - permanently stuck with
+     * whatever type was current when THEY were processed (usually the
+     * INT32 default), since nothing revisits an already-processed
+     * instruction. Repeating the whole pass lets a promotion found late
+     * apply everywhere on the next round. This can only take at most
+     * local_count passes: each pass can only promote previously-int
+     * locals to float (never the reverse), so it's bounded and always
+     * terminates. */
+    NativeType prev_local_types[NC_MAX_LOCALS];
+
+    /* Per-block entry type stack, mirroring ir_to_native's block_entry_depth
+     * fix in native_compiler.c: a branch-target block isn't necessarily
+     * entered with an empty stack - e.g. a ternary merge point receives
+     * whatever type its arms pushed (a float, if both arms produce floats).
+     * Without this, every block used to start from a hard-reset empty
+     * stack, so a STORE_LOCAL sitting right at a merge point always popped
+     * NATIVE_TYPE_UNKNOWN and silently fell back to the local's existing
+     * (default INT32) type instead of ever seeing - and promoting to - the
+     * real incoming float type. Persisted across outer passes and refreshed
+     * every pass so a promotion discovered on one pass's block reaches its
+     * successors on the same or next pass, same convergence argument as the
+     * local_types stabilization loop below. */
+    NativeType block_entry_types[NC_MAX_BASIC_BLOCKS][NC_MAX_STACK_DEPTH];
+    int block_entry_depth[NC_MAX_BASIC_BLOCKS];
+    for (int b = 0; b < ir->block_count; b++) block_entry_depth[b] = -1;
+
+    for (int pass = 0; pass <= ir->local_count; pass++) {
+        memcpy(prev_local_types, ir->local_types, sizeof(NativeType) * ir->local_count);
+
     /* Process each basic block with its own stack state */
-    /* For loops, we allow UNKNOWN types and infer from context */
     for (int b = 0; b < ir->block_count; b++) {
         TypeStack stack;
-        type_stack_init(&stack);
-        
-        /* If this block is a loop target, start with empty stack */
-        /* Otherwise, we could inherit from predecessor, but for simplicity
-         * we'll infer types per-block and allow UNKNOWN */
-        
-        int result = infer_block_types(&ir->blocks[b], ir->local_types, 
+        if (block_entry_depth[b] >= 0) {
+            stack.depth = block_entry_depth[b];
+            memcpy(stack.types, block_entry_types[b], sizeof(NativeType) * stack.depth);
+        } else {
+            /* Not yet reached by a predecessor this pass (e.g. a loop
+             * header on the first pass, before its back-edge has been
+             * processed) - empty stack is the safe default. */
+            type_stack_init(&stack);
+        }
+
+        int result = infer_block_types(&ir->blocks[b], ir->local_types,
                                        ir->local_count, &stack);
         if (result < 0) {
             /* Type inference failed - try again with more permissive rules */
@@ -807,6 +865,22 @@ int infer_types(IRFunction *ir, const NativeFuncSignature *sig) {
                     case IR_RETURN_VOID:
                         instr->type = NATIVE_TYPE_VOID;
                         break;
+                    case IR_CALL_C_FUNC:
+                    case IR_CALL:
+                    case IR_TAIL_CALL: {
+                        /* Keep the stack balanced and the return type honest
+                         * here too - this fallback runs for any block the
+                         * strict pass rejected, and a call left unbalanced
+                         * corrupts the types of everything after it. */
+                        for (int a = 0; a < instr->operand.call.arg_count; a++) {
+                            if (stack.depth > 0) type_stack_pop(&stack);
+                        }
+                        NativeType rt = instr->operand.call.ret_type;
+                        if (rt == NATIVE_TYPE_UNKNOWN) rt = NATIVE_TYPE_INT32;
+                        if (rt != NATIVE_TYPE_VOID) type_stack_push(&stack, rt);
+                        instr->type = rt;
+                        break;
+                    }
                     default:
                         /* For unknown ops, try to maintain stack balance */
                         instr->type = NATIVE_TYPE_UNKNOWN;
@@ -814,8 +888,30 @@ int infer_types(IRFunction *ir, const NativeFuncSignature *sig) {
                 }
             }
         }
+
+        /* Propagate this block's final stack state to whichever successors
+         * haven't been reached yet this pass, so they don't fall back to an
+         * empty stack when their turn comes later in this same loop (the
+         * common forward-jump case) or on the next outer pass (the backward
+         * / loop-header case). */
+        {
+            int depth = stack.depth;
+            if (depth > NC_MAX_STACK_DEPTH) depth = NC_MAX_STACK_DEPTH;
+            for (int s = 0; s < 2; s++) {
+                int succ = ir->blocks[b].successors[s];
+                if (succ >= 0 && succ < ir->block_count) {
+                    block_entry_depth[succ] = depth;
+                    memcpy(block_entry_types[succ], stack.types, sizeof(NativeType) * depth);
+                }
+            }
+        }
     }
-    
+
+        if (memcmp(prev_local_types, ir->local_types, sizeof(NativeType) * ir->local_count) == 0) {
+            break;  /* No local was promoted this pass - types have stabilized */
+        }
+    }
+
     return 0;
 }
 

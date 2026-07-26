@@ -167,9 +167,9 @@ static JSValue js_native_compile(JSContext *ctx, JSValue this_val,
         compiler->local_struct_defs[i] = arg_struct_defs[i];
 
     CompileResult result = athena_native_compile_function(ctx, js_func, &sig);
-    
+
     if (!result.success) {
-        return JS_ThrowInternalError(ctx, "Compilation failed: %s", 
+        return JS_ThrowInternalError(ctx, "Compilation failed: %s",
                                      result.error_msg ? result.error_msg : "unknown error");
     }
     

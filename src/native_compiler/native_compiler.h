@@ -27,6 +27,7 @@
  #define NC_MAX_LOCALS       32      /* Maximum local variables */
  #define NC_MAX_STACK_DEPTH  64      /* Maximum operand stack depth */
  #define NC_MAX_BASIC_BLOCKS 128     /* Maximum basic blocks in IR */
+ #define NC_MAX_PENDING_INTRINSICS 8 /* Max nesting of Math.x(Math.y(...)) calls */
  
  /*
   * Intermediate Representation (IR) opcodes
@@ -304,10 +305,32 @@
     uint8_t used_saved_regs;  /* Bitmask of used $s0-$s7 registers (bit 0 = $s0, etc) */
     bool has_loops;           /* True if function contains loops (backward jumps) */
     
-    /* Pending intrinsic call from OP_get_field2 - avoids emitting IR markers */
+    /* Pending intrinsic call from OP_get_field2 - avoids emitting IR markers.
+     * These three fields hold the entry currently being resolved by
+     * OP_get_field2; it is then pushed onto pending_intrinsic_stack below. */
     NativeFuncEntry *pending_intrinsic_entry;  /* Function entry for C calls, NULL if none */
     IROp pending_intrinsic_op;                 /* IR opcode (IR_SQRT_F32, IR_ABS_F32, or IR_CALL_C_FUNC) */
     NativeType pending_intrinsic_elem_type;    /* Element type for dynamic array intrinsics */
+
+    /* Resolved-but-not-yet-called intrinsics, innermost last.
+     *
+     * A single pending slot breaks as soon as one intrinsic appears inside
+     * another's arguments - e.g. Math.atan2(-dy, Math.sqrt(x)). QuickJS emits
+     * get_field2(atan2), <args...>, get_field2(sqrt), <args...>,
+     * call_method(sqrt), call_method(atan2): the inner get_field2 used to
+     * overwrite the outer one, so by the time the outer call_method ran there
+     * was no pending entry left and it fell back to a generic indirect
+     * IR_TAIL_CALL - which pops a callee pointer that was never pushed, and
+     * jumped to whatever float happened to sit on the eval stack.
+     *
+     * get_field2 pushes and call_method/tail_call_method pops, which matches
+     * the strict nesting of the bytecode. */
+    struct {
+        NativeFuncEntry *entry;
+        IROp op;
+        NativeType elem_type;
+    } pending_intrinsic_stack[NC_MAX_PENDING_INTRINSICS];
+    int pending_intrinsic_depth;
 
     /* QuickJS constant pool (not owned, valid during compile) */
     JSValueConst *cpool;
@@ -317,6 +340,16 @@
      * (used to resolve nested native functions captured as closure vars) */
     JSValueConst current_js_func;
     int closure_var_count;
+
+    /* Signature of the most recently resolved nested-call target (set by
+     * nc_resolve_closure_func_ptr/nc_resolve_cpool_func_ptr when they
+     * successfully resolve a callee, consumed by the OP_call/OP_tail_call
+     * decode case right after). Lets IR_CALL/IR_TAIL_CALL codegen convert
+     * literal arguments (which reach IR as IR_CONST_I32 regardless of `f`
+     * suffix - see IR_RETURN) to the bit pattern the callee actually
+     * expects, instead of passing raw mismatched bits. */
+    NativeFuncSignature pending_call_sig;
+    bool has_pending_call_sig;
 
     /* Compile-time string literals (owned, freed after each compile) */
     char **compile_string_literals;

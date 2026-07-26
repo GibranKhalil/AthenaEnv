@@ -27,11 +27,13 @@ extern JSClassID js_struct_class_id;
 #define SHORT_OPCODES 1
 
 /* Debug trace layer for the compiler pipeline.
- * Set NC_TRACE to 1 to get step-by-step logging of the pre-scan, the
- * bytecode->IR decode loop, and the IR->MIPS emit loop. Each line is flushed
- * immediately so the last line printed before a hang pinpoints the culprit. */
+ * Build with -DNC_TRACE=1 to get step-by-step logging of the pre-scan, the
+ * bytecode->IR decode loop, register/local allocation, and the IR->MIPS emit
+ * loop. Each line is flushed immediately so the last line printed before a
+ * hang pinpoints the culprit. Off by default - it prints several lines per
+ * compiled function, which drowns out a program's own output. */
 #ifndef NC_TRACE
-#define NC_TRACE 1
+#define NC_TRACE 0
 #endif
 
 #if NC_TRACE
@@ -511,6 +513,8 @@ static void *nc_resolve_cpool_func_ptr(NativeCompiler *nc, int cpool_idx) {
     NativeFunc *func = (NativeFunc *)(uintptr_t)h;
     if (!func || !func->is_valid || !func->code_ptr)
         return NULL;
+    nc->pending_call_sig = func->sig;
+    nc->has_pending_call_sig = true;
     return func->code_ptr;
 }
 
@@ -534,6 +538,8 @@ static void *nc_resolve_closure_func_ptr(NativeCompiler *nc, int var_ref_idx) {
     NativeFunc *func = (NativeFunc *)(uintptr_t)h;
     if (!func || !func->is_valid || !func->code_ptr)
         return NULL;
+    nc->pending_call_sig = func->sig;
+    nc->has_pending_call_sig = true;
     return func->code_ptr;
 }
 
@@ -541,6 +547,29 @@ static void nc_emit_func_ptr_const(NativeCompiler *nc, IRFunction *ir, int block
     IRInstr instr = { .op = IR_CONST_I32, .type = NATIVE_TYPE_PTR };
     instr.operand.i32 = (int32_t)(intptr_t)code_ptr;
     ir_emit(ir, block, &instr);
+}
+
+/*
+ * If nc_resolve_closure_func_ptr/nc_resolve_cpool_func_ptr just resolved the
+ * callee for this call/tail-call, stamp its real signature onto the IR
+ * instruction (return type + per-argument types) instead of leaving the
+ * hardcoded INT32 defaults. Without this, calling a float-returning nested
+ * function (e.g. lerp/clamp) from a plain (non-tail) call reads the result
+ * from $v0 instead of $f0, and literal arguments (which are IR_CONST_I32
+ * regardless of an `f` suffix) get passed as raw mismatched bits instead of
+ * being converted to what the callee actually expects - see IR_CALL's
+ * codegen, which uses arg_types[] to decide.
+ */
+static void nc_apply_pending_call_sig(NativeCompiler *nc, IRInstr *call) {
+    if (!nc->has_pending_call_sig) return;
+    call->type = nc->pending_call_sig.return_type;
+    call->operand.call.ret_type = nc->pending_call_sig.return_type;
+    int n = call->operand.call.arg_count;
+    if (n > 8) n = 8;
+    for (int i = 0; i < n; i++) {
+        call->operand.call.arg_types[i] = nc->pending_call_sig.arg_types[i];
+    }
+    nc->has_pending_call_sig = false;
 }
 
 static void *nc_array_push_fn(NativeType elem) {
@@ -770,6 +799,27 @@ int ir_create_block(IRFunction *ir) {
     return idx;
 }
 
+/*
+ * True if a block might still fall through to whatever bytecode comes right
+ * after it (empty block, or its last instruction isn't an unconditional
+ * jump/return). False for a block that has already emitted a terminating
+ * instruction - such a block never actually reaches the next sequential PC
+ * at runtime even though the raw bytecode decoder's pc keeps advancing past
+ * it (e.g. a ternary's then-arm ends in an unconditional jump to the merge
+ * point, and the bytes immediately following it are the unrelated else-arm,
+ * reached only via a separate explicit branch, never by falling off the
+ * then-arm). Used to decide whether recording a successors[1] fallthrough
+ * edge for a block is actually true, instead of just recording whatever
+ * bytecode happens to sit at the next PC.
+ */
+static bool block_falls_through(const IRFunction *ir, int block_idx) {
+    if (block_idx < 0 || block_idx >= ir->block_count) return false;
+    const IRBasicBlock *block = &ir->blocks[block_idx];
+    if (block->instr_count == 0) return true;
+    IROp last_op = block->instrs[block->instr_count - 1].op;
+    return last_op != IR_JUMP && last_op != IR_RETURN && last_op != IR_RETURN_VOID;
+}
+
 void ir_emit(IRFunction *ir, int block_idx, const IRInstr *instr) {
     if (!ir || block_idx < 0 || block_idx >= ir->block_count || !instr) return;
     
@@ -931,6 +981,7 @@ static int optimize_ir_dead_code(IRFunction *ir) {
                 case IR_STORE_LOCAL:
                 case IR_STORE_ARRAY:
                 case IR_CALL:
+                case IR_TAIL_CALL:
                 case IR_CALL_C_FUNC:
                 case IR_ADD_LOCAL_CONST:
                     needed[i] = true;
@@ -1284,7 +1335,7 @@ static int optimize_ir_cse(IRFunction *ir) {
             if (instr->op == IR_STORE_LOCAL || instr->op == IR_STORE_ARRAY ||
                 instr->op == IR_JUMP || instr->op == IR_JUMP_IF_TRUE ||
                 instr->op == IR_JUMP_IF_FALSE || instr->op == IR_CALL ||
-                instr->op == IR_CALL_C_FUNC) {
+                instr->op == IR_TAIL_CALL || instr->op == IR_CALL_C_FUNC) {
                 cache_count = 0;  /* Clear cache */
             }
         }
@@ -1498,6 +1549,7 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
     nc->pending_intrinsic_op = IR_NOP;
     nc->pending_intrinsic_entry = NULL;
     nc->pending_intrinsic_elem_type = NATIVE_TYPE_UNKNOWN;
+    nc->pending_intrinsic_depth = 0;
     nc->last_put_field_target = -1;
     
     /* Note: local_struct_defs is populated by ath_native.c with per-argument struct defs
@@ -1535,12 +1587,15 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
         if (op == OP_goto8 || op == OP_goto16 || op == OP_goto) {
             size_t target_pc;
             if (op == OP_goto8) {
+                /* Relative to the offset byte's own position, not the byte
+                 * after it - see the matching fix/comment on OP_goto8 in the
+                 * main decode loop below for why. */
                 int8_t offset = (int8_t)bytecode[scan_pc++];
-                target_pc = scan_pc + offset;
+                target_pc = (scan_pc - 1) + offset;
             } else if (op == OP_goto16) {
                 int16_t offset = (int16_t)(bytecode[scan_pc] | (bytecode[scan_pc+1] << 8));
                 scan_pc += 2;
-                target_pc = scan_pc + offset;
+                target_pc = (scan_pc - 2) + offset;
             } else {
                 int32_t offset = (int32_t)(bytecode[scan_pc] | (bytecode[scan_pc+1] << 8) |
                                           (bytecode[scan_pc+2] << 16) | (bytecode[scan_pc+3] << 24));
@@ -1556,7 +1611,23 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                      * NOTE: check_pc is size_t; iterate with a +1 bias so that
                      * reaching 0 doesn't underflow into SIZE_MAX (infinite loop). */
                     size_t search_limit = (target_pc > 10) ? (target_pc - 10) : 0;
-                    for (size_t check_pc = target_pc; check_pc-- > search_limit; ) {
+                    /* +1 bias: check_pc-- makes the first body iteration use
+                     * check_pc==target_pc itself (any instruction trivially
+                     * "contains" its own start byte, size>=1) before searching
+                     * backwards. Without this, the loop's first candidate was
+                     * target_pc-1, so a target_pc that IS already a valid,
+                     * aligned opcode start (the common case) was never even
+                     * considered - the search would walk into a PRECEDING
+                     * instruction's operand bytes instead, misinterpret that
+                     * garbage byte as an opcode, and could land on a
+                     * completely wrong block if that fake "opcode" happened to
+                     * report a size reaching past target_pc. This produced a
+                     * real infinite loop: a loop's back-edge jump landing on
+                     * the function's entry block instead of the loop-condition
+                     * block re-initializes every local (including the loop
+                     * counter) every "iteration", so the exit condition never
+                     * becomes true. */
+                    for (size_t check_pc = target_pc + 1; check_pc-- > search_limit; ) {
                         uint8_t check_op = bytecode[check_pc];
                         int check_size = get_opcode_info(check_op)->size;
                         if (check_pc + check_size > target_pc) {
@@ -1571,20 +1642,37 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
         } else if (op == OP_if_false8 || op == OP_if_true8 || op == OP_if_false || op == OP_if_true) {
             size_t target_pc;
             if (op == OP_if_false8 || op == OP_if_true8) {
+                /* Same "relative to the offset byte itself" fix as OP_goto8. */
                 int8_t offset = (int8_t)bytecode[scan_pc++];
-                target_pc = scan_pc + offset;
+                target_pc = (scan_pc - 1) + offset;
             } else {
                 int32_t offset = (int32_t)(bytecode[scan_pc] | (bytecode[scan_pc+1] << 8) |
                                           (bytecode[scan_pc+2] << 16) | (bytecode[scan_pc+3] << 24));
                 scan_pc += 4;
                 target_pc = (scan_pc - 4) + offset;
             }
-            
+
             if (target_pc < bytecode_len && target_pc < map_size) {
                 size_t opcode_start = target_pc;
                 if (target_pc > 0) {
                     size_t search_limit = (target_pc > 10) ? (target_pc - 10) : 0;
-                    for (size_t check_pc = target_pc; check_pc-- > search_limit; ) {
+                    /* +1 bias: check_pc-- makes the first body iteration use
+                     * check_pc==target_pc itself (any instruction trivially
+                     * "contains" its own start byte, size>=1) before searching
+                     * backwards. Without this, the loop's first candidate was
+                     * target_pc-1, so a target_pc that IS already a valid,
+                     * aligned opcode start (the common case) was never even
+                     * considered - the search would walk into a PRECEDING
+                     * instruction's operand bytes instead, misinterpret that
+                     * garbage byte as an opcode, and could land on a
+                     * completely wrong block if that fake "opcode" happened to
+                     * report a size reaching past target_pc. This produced a
+                     * real infinite loop: a loop's back-edge jump landing on
+                     * the function's entry block instead of the loop-condition
+                     * block re-initializes every local (including the loop
+                     * counter) every "iteration", so the exit condition never
+                     * becomes true. */
+                    for (size_t check_pc = target_pc + 1; check_pc-- > search_limit; ) {
                         uint8_t check_op = bytecode[check_pc];
                         int check_size = get_opcode_info(check_op)->size;
                         if (check_pc + check_size > target_pc) {
@@ -1639,21 +1727,60 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
             /* If this PC is a jump target, we need to create a new block for it */
             if (jump_targets[current_pc]) {
                 if (label_map[current_pc] < 0) {
-                    /* First time we see this jump target, create a new block */
+                    /* First time we see this jump target, create a new block.
+                     * We got here by simple sequential fallthrough from
+                     * prev_block (no explicit goto/if_false - those already
+                     * set successors[0]/[1] themselves), so prev_block's
+                     * successors[1] must record this transition, exactly like
+                     * the "already processed" branch below does. Missing this
+                     * left successors[1] at ir_create_block()'s default of -1,
+                     * which made compute_block_entry_depths() (see ir_to_native)
+                     * treat prev_block as having no successor at all - hiding
+                     * every value it pushed for a later merge block from the
+                     * stack-depth propagation. */
+                    int prev_block = current_block;
                     current_block = ir_create_block(ir_out);
                     label_map[current_pc] = current_block;
+                    if (block_falls_through(ir_out, prev_block)) {
+                        ir_out->blocks[prev_block].successors[1] = current_block;
+                    }
                 } else if (label_map[current_pc] != current_block) {
                     /* This PC is a jump target that was already processed in a different block.
-                     * We need to switch to that block to split the current block. */
+                     * We need to switch to that block to split the current block.
+                     *
+                     * We're reaching it by falling off the end of current_block's
+                     * bytecode (no explicit goto/if_false got us here - those
+                     * already set successors[0]/[1] themselves), so current_block
+                     * genuinely falls through into it at runtime. ir_create_block()
+                     * defaulted current_block's successors[1] to current_block+1,
+                     * which is very often just wrong here (e.g. a ternary's
+                     * else-branch is discovered as a NEW, higher-numbered block
+                     * while its merge point - the then-branch's goto target - was
+                     * already discovered earlier as a LOWER-numbered one; the
+                     * final code layout is strictly by block index, so "the next
+                     * index" and "the block we actually continue into" are two
+                     * different things). ir_to_native only inserts an explicit
+                     * jump when successors[1] says to, and leaves alone any block
+                     * that already ends in an unconditional jump/return - so
+                     * fixing this up here is always correct, never redundant. */
+                    int prev_block = current_block;
                     current_block = label_map[current_pc];
+                    if (block_falls_through(ir_out, prev_block)) {
+                        ir_out->blocks[prev_block].successors[1] = current_block;
+                    }
                 }
                 /* If label_map[current_pc] == current_block, we're already in the correct block */
             } else if (label_map[current_pc] < 0) {
                 /* First time we see this PC, map it to current block */
                 label_map[current_pc] = current_block;
             } else if (label_map[current_pc] != current_block) {
-                /* This PC is a target from a previous jump, switch to that block */
+                /* This PC is a target from a previous jump, switch to that block -
+                 * same fallthrough-successor fixup as above. */
+                int prev_block = current_block;
                 current_block = label_map[current_pc];
+                if (block_falls_through(ir_out, prev_block)) {
+                    ir_out->blocks[prev_block].successors[1] = current_block;
+                }
             }
         }
         
@@ -2483,8 +2610,16 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
             
             case OP_goto8: {
                 int8_t offset = (int8_t)bytecode[pc++];
-                /* OP_goto8 offset is relative to the byte AFTER the opcode (pc after increment) */
-                size_t target_pc = pc + offset;
+                /* Relative to the offset byte's OWN position (pc - 1), not the
+                 * byte after it - matches the interpreter (quickjs.c CASE(OP_goto8):
+                 * pc[0] is read without pre-advancing past it) and mirrors the
+                 * identical fix already applied to if_false8/if_true8 below.
+                 * The old `pc + offset` here landed 1 byte past the true target -
+                 * e.g. for a ternary whose "then" arm jumps over the "else" arm's
+                 * tail, that off-by-one skipped past the shared put_loc storing
+                 * the ternary's result, leaving it stranded on the operand stack
+                 * for that arm instead of merged into the local both arms use. */
+                size_t target_pc = (pc - 1) + offset;
                 
                 /* Find the start of the opcode that contains target_pc */
                 size_t opcode_start = target_pc;
@@ -2492,7 +2627,23 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                     /* Search backwards to find the opcode that contains target_pc.
                      * Iterate with a +1 bias so reaching 0 doesn't underflow (infinite loop). */
                     size_t search_limit = (target_pc > 10) ? (target_pc - 10) : 0;
-                    for (size_t check_pc = target_pc; check_pc-- > search_limit; ) {
+                    /* +1 bias: check_pc-- makes the first body iteration use
+                     * check_pc==target_pc itself (any instruction trivially
+                     * "contains" its own start byte, size>=1) before searching
+                     * backwards. Without this, the loop's first candidate was
+                     * target_pc-1, so a target_pc that IS already a valid,
+                     * aligned opcode start (the common case) was never even
+                     * considered - the search would walk into a PRECEDING
+                     * instruction's operand bytes instead, misinterpret that
+                     * garbage byte as an opcode, and could land on a
+                     * completely wrong block if that fake "opcode" happened to
+                     * report a size reaching past target_pc. This produced a
+                     * real infinite loop: a loop's back-edge jump landing on
+                     * the function's entry block instead of the loop-condition
+                     * block re-initializes every local (including the loop
+                     * counter) every "iteration", so the exit condition never
+                     * becomes true. */
+                    for (size_t check_pc = target_pc + 1; check_pc-- > search_limit; ) {
                         uint8_t check_op = bytecode[check_pc];
                         int check_size = get_opcode_info(check_op)->size;
                         if (check_pc + check_size > target_pc) {
@@ -2518,7 +2669,6 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                         label_map[opcode_start] = target;
                     }
                 }
-                
                 ir_emit_jump(ir_out, current_block, target);
                 
                 /* CRITICAL FIX: After goto, check if there's ALREADY a label for the next PC
@@ -2554,7 +2704,9 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
             case OP_goto16: {
                 int16_t offset = (int16_t)(bytecode[pc] | (bytecode[pc+1] << 8));
                 pc += 2;
-                size_t target_pc = pc + offset;
+                /* Relative to the offset bytes' OWN start (pc - 2), same fix as
+                 * OP_goto8 above - see that comment for why. */
+                size_t target_pc = (pc - 2) + offset;
                 
                 /* Get or create block for target PC */
                 int target;
@@ -2958,7 +3110,24 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                     }
                 }
                 
-                /* Don't emit any IR for intrinsics - pending_intrinsic will be consumed by call_method */
+                /* Don't emit any IR for intrinsics - the entry is consumed by
+                 * the matching call_method/tail_call_method below. Push rather
+                 * than leave it in the scalar fields, so an intrinsic nested in
+                 * another one's arguments (Math.atan2(x, Math.sqrt(y))) doesn't
+                 * clobber the outer one - see pending_intrinsic_stack. */
+                if (nc->pending_intrinsic_op != IR_NOP) {
+                    if (nc->pending_intrinsic_depth >= NC_MAX_PENDING_INTRINSICS) {
+                        nc->has_error = true;
+                        snprintf(nc->error_msg, sizeof(nc->error_msg),
+                                 "Too many nested intrinsic calls (max %d)",
+                                 NC_MAX_PENDING_INTRINSICS);
+                        return -1;
+                    }
+                    int d = nc->pending_intrinsic_depth++;
+                    nc->pending_intrinsic_stack[d].op = nc->pending_intrinsic_op;
+                    nc->pending_intrinsic_stack[d].entry = nc->pending_intrinsic_entry;
+                    nc->pending_intrinsic_stack[d].elem_type = nc->pending_intrinsic_elem_type;
+                }
                 break;
             }
             
@@ -3063,9 +3232,11 @@ found_base:
                 bool emitted_intrinsic = false;
                 
                 /* Check if we have a pending intrinsic from OP_get_field2 */
-                if (nc->pending_intrinsic_op != IR_NOP && nargs >= 0 && nargs <= 8) {
-                    IROp intrinsic_op = nc->pending_intrinsic_op;
-                    NativeFuncEntry *entry = nc->pending_intrinsic_entry;
+                if (nc->pending_intrinsic_depth > 0 && nargs >= 0 && nargs <= 8) {
+                    int d = --nc->pending_intrinsic_depth;
+                    IROp intrinsic_op = nc->pending_intrinsic_stack[d].op;
+                    NativeFuncEntry *entry = nc->pending_intrinsic_stack[d].entry;
+                    nc->pending_intrinsic_elem_type = nc->pending_intrinsic_stack[d].elem_type;
                     
                     /* Native FPU intrinsics (sqrt, abs, sign, fround) - only for single-arg */
                     if ((intrinsic_op == IR_SQRT_F32 || intrinsic_op == IR_ABS_F32 || intrinsic_op == IR_SIGN_F32 || intrinsic_op == IR_FROUND_F32) && nargs == 1) {
@@ -3156,16 +3327,18 @@ found_base:
                 }
                 
                 if (!emitted_intrinsic) {
-                    /* Generic method call - emit IR_CALL stub */
-                    IRInstr call = { .op = IR_CALL, .type = NATIVE_TYPE_FLOAT32 };
-                    call.operand.call.func_ptr = NULL;
-                    call.operand.call.arg_count = nargs;
-                    call.operand.call.ret_type = NATIVE_TYPE_FLOAT32;
-                    /* Initialize arg_types to avoid uninitialized memory */
-                    for (int i = 0; i < 8; i++) {
-                        call.operand.call.arg_types[i] = NATIVE_TYPE_FLOAT32;
-                    }
-                    ir_emit(ir_out, current_block, &call);
+                    /* No intrinsic matched. Emitting a generic indirect IR_CALL
+                     * here would be a silent miscompile: an indirect call pops a
+                     * callee pointer off the eval stack, but a method call never
+                     * pushes one (Math.xxx resolves at compile time, and nothing
+                     * else is supported), so it would jump to whatever value
+                     * happened to be on top. Fail the compile instead. */
+                    nc->has_error = true;
+                    snprintf(nc->error_msg, sizeof(nc->error_msg),
+                             "Unsupported method call with %d argument(s) at pc=%zu "
+                             "(only Math.* intrinsics and registered C functions "
+                             "are callable as methods)", nargs, current_pc);
+                    return -1;
                 }
                 break;
             }
@@ -3189,9 +3362,11 @@ found_base:
                 bool emitted_intrinsic = false;
                 
                 /* Check if we have a pending intrinsic from OP_get_field2 */
-                if (nc->pending_intrinsic_op != IR_NOP && nargs >= 0 && nargs <= 8) {
-                    IROp intrinsic_op = nc->pending_intrinsic_op;
-                    NativeFuncEntry *entry = nc->pending_intrinsic_entry;
+                if (nc->pending_intrinsic_depth > 0 && nargs >= 0 && nargs <= 8) {
+                    int d = --nc->pending_intrinsic_depth;
+                    IROp intrinsic_op = nc->pending_intrinsic_stack[d].op;
+                    NativeFuncEntry *entry = nc->pending_intrinsic_stack[d].entry;
+                    nc->pending_intrinsic_elem_type = nc->pending_intrinsic_stack[d].elem_type;
                     
                     /* Native FPU intrinsics (sqrt, abs, sign, fround) - only for single-arg */
                     if ((intrinsic_op == IR_SQRT_F32 || intrinsic_op == IR_ABS_F32 || intrinsic_op == IR_SIGN_F32 || intrinsic_op == IR_FROUND_F32) && nargs == 1) {
@@ -3285,16 +3460,16 @@ found_base:
                     /* tail_call_method ends the function — return the intrinsic result */
                     ir_emit_return(ir_out, current_block, ir_out->sig.return_type);
                 } else {
-                    /* Generic tail call - emit IR_TAIL_CALL stub */
-                    IRInstr call = { .op = IR_TAIL_CALL, .type = NATIVE_TYPE_FLOAT32 };
-                    call.operand.call.func_ptr = NULL;
-                    call.operand.call.arg_count = nargs;
-                    call.operand.call.ret_type = NATIVE_TYPE_FLOAT32;
-                    /* Initialize arg_types to avoid uninitialized memory */
-                    for (int i = 0; i < 8; i++) {
-                        call.operand.call.arg_types[i] = NATIVE_TYPE_FLOAT32;
-                    }
-                    ir_emit(ir_out, current_block, &call);
+                    /* Same reasoning as the OP_call_method fallback above: an
+                     * indirect tail call would jump to a callee pointer that was
+                     * never pushed. This is exactly how Math.atan2(a, Math.sqrt(b))
+                     * used to end up doing JR on a float's bit pattern. */
+                    nc->has_error = true;
+                    snprintf(nc->error_msg, sizeof(nc->error_msg),
+                             "Unsupported method call with %d argument(s) at pc=%zu "
+                             "(only Math.* intrinsics and registered C functions "
+                             "are callable as methods)", nargs, current_pc);
+                    return -1;
                 }
                 break;
             }
@@ -3311,16 +3486,17 @@ found_base:
                 uint16_t nargs = bytecode[pc] | (bytecode[pc+1] << 8);
                 pc += 2;
                 /* Emit IR_CALL - assumes function pointer and args are on stack */
-                IRInstr call = { 
-                    .op = IR_CALL, 
+                IRInstr call = {
+                    .op = IR_CALL,
                     .type = NATIVE_TYPE_INT32  /* Default return type */
                 };
                 call.operand.call.arg_count = nargs;
                 call.operand.call.func_ptr = NULL;  /* Indirect call */
+                nc_apply_pending_call_sig(nc, &call);
                 ir_emit(ir_out, current_block, &call);
                 break;
             }
-            
+
             #ifdef SHORT_OPCODES
             /* Short call opcodes - emit IR_CALL with 0-3 args */
             case OP_call0:
@@ -3328,30 +3504,32 @@ found_base:
             case OP_call2:
             case OP_call3: {
                 int nargs = op - OP_call0;
-                IRInstr call = { 
-                    .op = IR_CALL, 
+                IRInstr call = {
+                    .op = IR_CALL,
                     .type = NATIVE_TYPE_INT32
                 };
                 call.operand.call.arg_count = nargs;
                 call.operand.call.func_ptr = NULL;
+                nc_apply_pending_call_sig(nc, &call);
                 ir_emit(ir_out, current_block, &call);
                 break;
             }
-            
+
             /* Tail call - same as call but uses IR_TAIL_CALL for TCO */
             case OP_tail_call: {
                 uint16_t nargs = bytecode[pc] | (bytecode[pc+1] << 8);
                 pc += 2;
-                IRInstr tail_call = { 
-                    .op = IR_TAIL_CALL, 
+                IRInstr tail_call = {
+                    .op = IR_TAIL_CALL,
                     .type = NATIVE_TYPE_INT32
                 };
                 tail_call.operand.call.arg_count = nargs;
                 tail_call.operand.call.func_ptr = NULL;
+                nc_apply_pending_call_sig(nc, &tail_call);
                 ir_emit(ir_out, current_block, &tail_call);
                 break;
             }
-            
+
             /* push_const8 - 1-byte constant pool index */
             case OP_push_const8: {
                 uint8_t idx = bytecode[pc++];
@@ -3498,6 +3676,33 @@ static bool detect_loops(const IRFunction *ir) {
 }
 
 /*
+ * Scan the IR for calls (to other native functions) that pass more than 4
+ * arguments. Args 4+ of such a call are staged on the stack at [$sp + i*4]
+ * right before the call (see IR_CALL codegen), so this function's own frame
+ * must reserve enough space at the very bottom ($fp+0) to hold them without
+ * clobbering its own locals. Returns the number of bytes to reserve (0 if
+ * this function makes no such call).
+ */
+static int compute_max_outgoing_arg_bytes(const IRFunction *ir) {
+    int max_bytes = 0;
+    for (int b = 0; b < ir->block_count; b++) {
+        const IRBasicBlock *block = &ir->blocks[b];
+        for (int i = 0; i < block->instr_count; i++) {
+            const IRInstr *instr = &block->instrs[i];
+            if (instr->op == IR_CALL || instr->op == IR_TAIL_CALL ||
+                instr->op == IR_CALL_C_FUNC) {
+                int argc = instr->operand.call.arg_count;
+                if (argc > 4) {
+                    int bytes = argc * 4;
+                    if (bytes > max_bytes) max_bytes = bytes;
+                }
+            }
+        }
+    }
+    return max_bytes;
+}
+
+/*
  * Map local variable index to register or stack slot.
  * Strategy:
  * - Arguments 0-3: use $a0-$a3
@@ -3517,8 +3722,12 @@ static void allocate_locals(NativeCompiler *nc, const IRFunction *ir) {
     
     /* Use argument registers for first 4 args */
     const MipsReg arg_regs[] = { REG_A0, REG_A1, REG_A2, REG_A3 };
-    
-    int stack_slot = 0;
+
+    /* Reserve [0, outgoing_arg_bytes) at the very bottom of the frame for
+     * staging args 4+ of any >4-arg call this function makes (see IR_CALL).
+     * Everything else below is allocated starting above that reservation. */
+    int outgoing_arg_bytes = compute_max_outgoing_arg_bytes(ir);
+    int stack_slot = outgoing_arg_bytes;
     nc->used_saved_regs = 0;  /* Reset bitmask; eval stack marks $s0-$s7 later */
     
     /* Detect loops in function */
@@ -3553,7 +3762,8 @@ static void allocate_locals(NativeCompiler *nc, const IRFunction *ir) {
         } else if (i >= 4 && i < ir->sig.arg_count) {
             /* Stack-passed arguments (args 4+) - passed by caller above our frame.
              * Mark with sentinel -2 and calculate actual offset later in prologue
-             * when frame_size is known. Offset will be: frame_size + (i-4)*4 */
+             * when frame_size is known. Offset will be: frame_size + i*4 (see
+             * the fixup in emit_function_prologue for why it's i*4, not (i-4)*4). */
             nc->local_regs[i] = -1;
             nc->local_stack_offs[i] = -2;  /* Sentinel: stack-passed arg */
         } else {
@@ -3581,10 +3791,9 @@ static void allocate_locals(NativeCompiler *nc, const IRFunction *ir) {
     
     nc->emitter.stack_offset = stack_slot;
     
-    /* DEBUG LOG */
-    printf("[allocate_locals] local_count=%d, stack_offset=%d\n", ir->local_count, stack_slot);
+    NC_LOG("allocate_locals: local_count=%d, stack_offset=%d", ir->local_count, stack_slot);
     for (int i = 0; i < ir->local_count && i < 4; i++) {
-        printf("  local[%d]: reg=%d, stack_offs=%d\n", i, nc->local_regs[i], nc->local_stack_offs[i]);
+        NC_LOG("  local[%d]: reg=%d, stack_offs=%d", i, nc->local_regs[i], nc->local_stack_offs[i]);
     }
     
     /* Determine if we need the frame pointer */
@@ -3736,10 +3945,18 @@ static void emit_function_prologue(NativeCompiler *nc, const NativeFuncSignature
     
     /* Fix up stack-passed argument offsets (args 4+).
      * These were marked with sentinel -2 in allocate_locals.
-     * They're passed by the caller at: $fp + frame_size + (i-4)*4 */
+     *
+     * The 32-bit MIPS calling convention this compiler targets reserves a
+     * 16-byte (4-word) argument save area for $a0-$a3 at the bottom of the
+     * outgoing argument block, even though those first 4 args arrive in
+     * registers. Stack-passed args (index 4+) are placed immediately above
+     * that reserved area, so arg i sits at byte offset i*4 from the
+     * caller's $sp at the call site - not (i-4)*4. Getting this wrong reads
+     * whatever the caller spilled into its a0-a3 save slots instead of the
+     * real argument (e.g. arg 6 silently returning arg 2's value). */
     for (int i = 4; i < sig->arg_count && i < NC_MAX_LOCALS; i++) {
         if (nc->local_stack_offs[i] == -2) {
-            nc->local_stack_offs[i] = frame_size + (i - 4) * 4;
+            nc->local_stack_offs[i] = frame_size + i * 4;
         }
     }
     
@@ -3844,16 +4061,39 @@ static void emit_function_epilogue(NativeCompiler *nc, const NativeFuncSignature
 }
 
 /*
+ * Push a new value onto the eval operand stack ($s0-$s7), checking capacity
+ * right at the push instead of blanket-rejecting at the top of every
+ * instruction. The old top-of-function check rejected ANY instruction
+ * (including IR_CALL/IR_TAIL_CALL) whenever stack_top was already 8, even
+ * though calls POP their callee + all args before pushing a single result -
+ * i.e. they reduce usage. That capped real nested-call argument capacity at
+ * 7 instead of 8 (funcptr + up to 7 args), and rejected calls that were
+ * about to resolve themselves. Checking here instead only blocks a genuine
+ * push overflow, wherever it happens in an instruction's expansion.
+ */
+static MipsReg nc_push_reg(NativeCompiler *nc) {
+    if (nc->stack_top >= 8) {
+        if (!nc->has_error) {
+            nc->has_error = true;
+            snprintf(nc->error_msg, sizeof(nc->error_msg),
+                     "Stack overflow: stack_top=%d (max 8)", nc->stack_top);
+        }
+        return (MipsReg)(REG_S0 + 7);  /* has_error aborts the compile below */
+    }
+    return (MipsReg)(REG_S0 + nc->stack_top++);
+}
+
+/*
  * Emit code for a single IR instruction.
  * Uses a simple stack-based approach with registers.
  * block_to_label: mapping from block index to MIPS label ID (can be NULL for instructions that don't need it)
  */
 static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const int *block_to_label) {
     MipsEmitter *em = &nc->emitter;
-    
+
     /* Log all IR instructions */
     /* op_names removed to fix unused variable warning */
-    
+
     /* Eval operand stack: $s0-$s7 (callee-saved, preserved across C runtime calls) */
     if (nc->stack_top < 0) {
         nc->stack_top = 0;  /* Reset if needed */
@@ -3861,20 +4101,12 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
     if (nc->stack_depth < 0) {
         nc->stack_depth = 0;  /* Reset if needed */
     }
-    
+
     #define STACK_REG(n) (REG_S0 + (n))
-    #define PUSH_REG() (STACK_REG(nc->stack_top++))
+    #define PUSH_REG() nc_push_reg(nc)
     #define POP_REG() (STACK_REG(--nc->stack_top))
     #define PEEK_REG() (STACK_REG(nc->stack_top - 1))
-    
-    /* Safety check: ensure we never use REG_AT as a stack register */
-    if (nc->stack_top >= 8) {
-        nc->has_error = true;
-        snprintf(nc->error_msg, sizeof(nc->error_msg), 
-                 "Stack overflow: stack_top=%d (max 8)", nc->stack_top);
-        return -1;
-    }
-    
+
     /* Type stack helpers - track types on the operand stack */
     #define PUSH_TYPE(t) do { \
         if (nc->stack_depth < NC_MAX_STACK_DEPTH) { \
@@ -3946,9 +4178,8 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             int idx = instr->operand.local_idx;
             int src_reg = (int)nc->local_regs[idx];  /* Cast to signed int for comparison */
             
-            /* DEBUG */
             if (idx >= 2) {
-                printf("[IR_LOAD_LOCAL] idx=%d, reg=%d, offset=%d\n", 
+                NC_LOG("IR_LOAD_LOCAL: idx=%d, reg=%d, offset=%d",
                        idx, src_reg, nc->local_stack_offs[idx]);
             }
             
@@ -4018,11 +4249,11 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             }
             
             if (nc->local_regs[idx] >= 0) {
-                printf("[IR_STORE_LOCAL] idx=%d → MOVE to reg %d\n", idx, nc->local_regs[idx]);
+                NC_LOG("IR_STORE_LOCAL: idx=%d -> MOVE to reg %d", idx, nc->local_regs[idx]);
                 /* Store to register */
                 mips_move(em, nc->local_regs[idx], src);
             } else {
-                printf("[IR_STORE_LOCAL] idx=%d → SW to offset %d (reg=%d)\n", 
+                NC_LOG("IR_STORE_LOCAL: idx=%d -> SW to offset %d (reg=%d)",
                        idx, nc->local_stack_offs[idx], nc->local_regs[idx]);
                 /* TEMPORARY WORKAROUND: Allow -1 offset for now */
                 /*
@@ -4150,13 +4381,13 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             /* Check if we have base and index on stack */
             if (nc->stack_top >= 2) {
                 /* Stack has both base and index - use them */
-                printf("[IR_STORE_ARRAY] Using values from stack (stack_top=%d)\n", nc->stack_top);
+                NC_LOG("IR_STORE_ARRAY: using values from stack (stack_top=%d)", nc->stack_top);
                 idx_reg = POP_REG();
                 idx_type = POP_TYPE();
                 base_reg = POP_REG();
                 base_type = POP_TYPE();
             } else {
-                printf("[IR_STORE_ARRAY] Reloading from memory (stack_top=%d)\n", nc->stack_top);
+                NC_LOG("IR_STORE_ARRAY: reloading from memory (stack_top=%d)", nc->stack_top);
                 /* Stack doesn't have base and index - reload from memory */
                 /* Find the destination array or struct pointer (last array/ptr argument) */
                 int base_arg_idx = -1;
@@ -6112,13 +6343,21 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
         case IR_GT_F32:
         case IR_GE_F32: {
             MipsReg r2 = POP_REG();
-            POP_TYPE();
+            NativeType t2 = POP_TYPE();
             MipsReg r1 = POP_REG();
-            POP_TYPE();
+            NativeType t1 = POP_TYPE();
             MipsFpuReg f0 = mips_alloc_fpr(em);
             MipsFpuReg f1 = mips_alloc_fpr(em);
             mips_mtc1(em, r1, f0);
             mips_mtc1(em, r2, f1);
+            /* Same literal-operand fixup as ADD_F32/etc: this op was
+             * promoted to the float variant because at least one side is
+             * float, but the OTHER side may still be a raw IR_CONST_I32
+             * (e.g. `v > -28` - -28 reaches here as an integer regardless
+             * of intent). Without this, its bits get compared as float
+             * garbage instead of the numeric value. */
+            if (NATIVE_TYPE_IS_INT(t1)) mips_cvt_s_w(em, f0, f0);
+            if (NATIVE_TYPE_IS_INT(t2)) mips_cvt_s_w(em, f1, f1);
             MipsReg dst = PUSH_REG();
             int true_label = mips_label_create(em);
             int end_label = mips_label_create(em);
@@ -6236,20 +6475,49 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             /* Native function call
              * Stack layout: [args..., func_ptr] -> [result]
              * MIPS calling convention: $a0-$a3 for first 4 args, rest on stack
+             * at [$sp + i*4] for arg index i (see allocate_locals's
+             * outgoing_arg_bytes reservation and the stack-passed-arg offset
+             * fixup in emit_function_prologue - both must agree with this).
              */
             int nargs = instr->operand.call.arg_count;
             void *func_ptr = instr->operand.call.func_ptr;
+            if (nargs > 8) nargs = 8;  /* eval stack depth caps args at 8 */
 
             /* QuickJS stack layout for a call is [func_ptr, arg0, arg1, ...] with
-             * the last argument on top. Pop the arguments first, then the function
-             * pointer (which sits below them). */
+             * the last argument on top. Pop ALL arguments (not just the first 4 -
+             * they're LIFO, so popping fewer than nargs would grab the LAST
+             * args instead of the first, and leave the rest stranded on the
+             * eval stack). */
             const MipsReg arg_regs[] = { REG_A0, REG_A1, REG_A2, REG_A3 };
-            MipsReg arg_vals[4];
-            int reg_args = (nargs < 4) ? nargs : 4;
+            MipsReg arg_vals[8];
+            NativeType arg_src_types[8];
 
-            for (int i = reg_args - 1; i >= 0; i--) {
+            for (int i = nargs - 1; i >= 0; i--) {
                 arg_vals[i] = POP_REG();
-                POP_TYPE();
+                arg_src_types[i] = POP_TYPE();
+            }
+
+            /* Literal args (e.g. `-1.0f`) reach here as IR_CONST_I32 - see
+             * IR_RETURN - so convert any argument whose tracked type doesn't
+             * match what the resolved callee actually expects (known only
+             * when nc_apply_pending_call_sig managed to stamp arg_types[];
+             * NATIVE_TYPE_UNKNOWN there means we don't know, so don't touch
+             * it - safer to pass raw bits than guess wrong). */
+            for (int i = 0; i < nargs; i++) {
+                NativeType expected = instr->operand.call.arg_types[i];
+                if (expected == NATIVE_TYPE_FLOAT32 && NATIVE_TYPE_IS_INT(arg_src_types[i])) {
+                    MipsFpuReg fpu = mips_alloc_fpr(em);
+                    mips_mtc1(em, arg_vals[i], fpu);
+                    mips_cvt_s_w(em, fpu, fpu);
+                    mips_mfc1(em, arg_vals[i], fpu);
+                    mips_free_fpr(em, fpu);
+                } else if (NATIVE_TYPE_IS_INT(expected) && arg_src_types[i] == NATIVE_TYPE_FLOAT32) {
+                    MipsFpuReg fpu = mips_alloc_fpr(em);
+                    mips_mtc1(em, arg_vals[i], fpu);
+                    mips_cvt_w_s(em, fpu, fpu);
+                    mips_mfc1(em, arg_vals[i], fpu);
+                    mips_free_fpr(em, fpu);
+                }
             }
 
             MipsReg target;
@@ -6263,16 +6531,27 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
                 POP_TYPE();
             }
 
+            int reg_args = (nargs < 4) ? nargs : 4;
+
             /* Move to arg registers (sources are $s regs, dests are $a regs, no hazard) */
             for (int i = 0; i < reg_args; i++) {
                 if (arg_vals[i] != arg_regs[i]) {
                     mips_move(em, arg_regs[i], arg_vals[i]);
                 }
             }
-            
+
+            /* Stage args 4+ on the stack, in our own frame's reserved
+             * outgoing-arg area (offset 0 from $sp/$fp - they're equal for
+             * our whole function body). The callee reads them at
+             * $fp_callee + frame_size_callee + i*4, which resolves to the
+             * same absolute address since $fp_callee == our $sp here. */
+            for (int i = 4; i < nargs; i++) {
+                mips_sw(em, arg_vals[i], i * 4, REG_SP);
+            }
+
             /* Mark function as non-leaf since we're making a call */
             nc->is_leaf = false;
-            
+
             /* Call the function (JALR $ra, target) */
             mips_jalr(em, REG_RA, target);
             mips_nop(em);  /* Delay slot */
@@ -6298,16 +6577,37 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
              */
             int nargs = instr->operand.call.arg_count;
             void *func_ptr = instr->operand.call.func_ptr;
+            if (nargs > 8) nargs = 8;  /* eval stack depth caps args at 8 */
 
-            /* QuickJS stack layout is [func_ptr, arg0, ...]; pop args first, then
-             * the function pointer below them. */
+            /* QuickJS stack layout is [func_ptr, arg0, ...]; pop ALL args first
+             * (LIFO - popping fewer than nargs would grab the LAST args instead
+             * of the first, same hazard as IR_CALL), then the function pointer
+             * below them. */
             const MipsReg arg_regs[] = { REG_A0, REG_A1, REG_A2, REG_A3 };
-            MipsReg arg_vals[4];
-            int reg_args = (nargs < 4) ? nargs : 4;
+            MipsReg arg_vals[8];
+            NativeType arg_src_types[8];
 
-            for (int i = reg_args - 1; i >= 0; i--) {
+            for (int i = nargs - 1; i >= 0; i--) {
                 arg_vals[i] = POP_REG();
-                POP_TYPE();
+                arg_src_types[i] = POP_TYPE();
+            }
+
+            /* Same literal-argument fixup as IR_CALL - see there for why. */
+            for (int i = 0; i < nargs; i++) {
+                NativeType expected = instr->operand.call.arg_types[i];
+                if (expected == NATIVE_TYPE_FLOAT32 && NATIVE_TYPE_IS_INT(arg_src_types[i])) {
+                    MipsFpuReg fpu = mips_alloc_fpr(em);
+                    mips_mtc1(em, arg_vals[i], fpu);
+                    mips_cvt_s_w(em, fpu, fpu);
+                    mips_mfc1(em, arg_vals[i], fpu);
+                    mips_free_fpr(em, fpu);
+                } else if (NATIVE_TYPE_IS_INT(expected) && arg_src_types[i] == NATIVE_TYPE_FLOAT32) {
+                    MipsFpuReg fpu = mips_alloc_fpr(em);
+                    mips_mtc1(em, arg_vals[i], fpu);
+                    mips_cvt_w_s(em, fpu, fpu);
+                    mips_mfc1(em, arg_vals[i], fpu);
+                    mips_free_fpr(em, fpu);
+                }
             }
 
             /* Resolve target into $t9. $t9 is a temp not restored by the epilogue,
@@ -6322,16 +6622,32 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
                 }
             }
             MipsReg target = REG_T9;
-            
+
+            int reg_args = (nargs < 4) ? nargs : 4;
             for (int i = 0; i < reg_args; i++) {
                 if (arg_vals[i] != arg_regs[i]) {
                     mips_move(em, arg_regs[i], arg_vals[i]);
                 }
             }
-            
-            /* Restore saved registers before jumping (reverse of prologue) */
+
             int frame_size = nc->emitter.stack_offset;
-            
+
+            /* Stage args 4+ at the callee's expected location AFTER this
+             * frame is torn down: $sp_after_restore + i*4, i.e.
+             * $sp_current + frame_size + i*4 (write now, using an immediate
+             * that already bakes in frame_size, since we haven't restored
+             * $sp yet). This reuses memory that was either our own incoming
+             * stack args (already consumed into registers above) or space
+             * our caller staged for calling us - safe because every call
+             * reachable from a JS entry point has at least
+             * MAX_NATIVE_ARGS(8)*4 bytes reserved there (native_func_call
+             * always calls through a fixed 8-argument C function pointer).
+             * Must run before the $s0-$s7 restore below, which would
+             * otherwise clobber the arg_vals registers being read here. */
+            for (int i = 4; i < nargs; i++) {
+                mips_sw(em, arg_vals[i], frame_size + i * 4, REG_SP);
+            }
+
             /* Restore $s registers if any */
             const MipsReg saved_regs[] = { REG_S0, REG_S1, REG_S2, REG_S3, REG_S4, REG_S5, REG_S6, REG_S7 };
             if (nc->used_saved_regs) {
@@ -6381,8 +6697,19 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             
             if (ret_type == NATIVE_TYPE_FLOAT32) {
                 /* Float return - value must go to $f0 */
-                /* The value in 'val' (GPR) contains float bits - move to $f0 */
                 mips_mtc1(em, val, FPU_F0);
+                /* Whole-number float literals (e.g. `6.0f`, `-1.0f`) reach here
+                 * as IR_CONST_I32, not IR_CONST_F32: QuickJS's bytecode uses
+                 * the same compact integer-push opcode for any integral
+                 * numeric literal regardless of the source's `f` suffix, so
+                 * that distinction is already lost by the time we see the
+                 * bytecode. If val_type says this value is still an integer,
+                 * MTC1 alone would just reinterpret its bit pattern as a
+                 * float (e.g. int -1 == 0xFFFFFFFF == a NaN as float bits) -
+                 * numerically convert it instead. */
+                if (NATIVE_TYPE_IS_INT(val_type)) {
+                    mips_cvt_s_w(em, FPU_F0, FPU_F0);
+                }
             } else {
                 /* Integer return - value must go to $v0 */
                 if (val == REG_AT) {
@@ -6452,17 +6779,165 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
         
         default:
             nc->has_error = true;
-            snprintf(nc->error_msg, sizeof(nc->error_msg), 
+            snprintf(nc->error_msg, sizeof(nc->error_msg),
                      "Unsupported IR opcode: %d", instr->op);
             return -1;
     }
-    
+
+    /* nc_push_reg() (used by PUSH_REG() above) can set has_error mid-switch
+     * without unwinding immediately, since it's called from deep inside each
+     * case rather than at a single entry point. Catch that here so overflow
+     * still aborts compilation instead of silently continuing with a
+     * clamped/aliased register. */
+    if (nc->has_error) {
+        return -1;
+    }
+
     return 0;
-    
+
     #undef STACK_REG
     #undef PUSH_REG
     #undef POP_REG
     #undef PEEK_REG
+}
+
+/*
+ * Net effect of a single IR instruction on the eval operand stack
+ * (pushes minus pops). Mirrors the push/pop pattern documented on each
+ * IROp in native_compiler.h and already implemented ad hoc throughout
+ * emit_ir_instruction (PUSH_REG/POP_REG call counts) - used only to
+ * compute per-block ENTRY stack depths (see compute_block_entry_depths
+ * below), never to drive codegen directly, so an occasional imprecise
+ * case here can't corrupt already-working straight-line code: it would
+ * only affect the entry depth of a block that's reached by more than one
+ * path, which is exactly the scenario this exists to fix.
+ */
+static int ir_op_stack_delta(const IRInstr *instr) {
+    switch (instr->op) {
+        /* Push 1, pop nothing */
+        case IR_CONST_I32: case IR_CONST_F32: case IR_CONST_I64:
+        case IR_LOAD_LOCAL:
+        case IR_STRING_NEW:
+        case IR_ARRAY_NEW:
+        case IR_DUP:
+        case IR_LOAD_FIELD_ADDR:
+            return 1;
+
+        /* Pop 1, push nothing */
+        case IR_STORE_LOCAL:
+        case IR_DROP:
+        case IR_JUMP_IF_TRUE:
+        case IR_JUMP_IF_FALSE:
+        case IR_RETURN:
+            return -1;
+
+        /* Pop 2, push nothing */
+        case IR_STORE_FIELD:
+            return -2;
+
+        /* Pop 3, push nothing */
+        case IR_STORE_ARRAY:
+            return -3;
+
+        /* Pop 1, push 1 (unary ops, conversions, field load) */
+        case IR_NEG_I32: case IR_NEG_I64: case IR_NEG_F32:
+        case IR_SQRT_F32: case IR_ABS_F32: case IR_SIGN_F32:
+        case IR_FROUND_F32: case IR_SATURATE_F32: case IR_RSQRT_F32:
+        case IR_STRING_LENGTH: case IR_STRING_TO_UPPER:
+        case IR_STRING_TO_LOWER: case IR_STRING_TRIM:
+        case IR_ARRAY_POP: case IR_ARRAY_LENGTH:
+        case IR_NOT:
+        case IR_I32_TO_F32: case IR_F32_TO_I32:
+        case IR_I32_TO_I64: case IR_I64_TO_I32:
+        case IR_I64_TO_F32: case IR_F32_TO_I64:
+        case IR_LOAD_FIELD:
+            return 0;
+
+        /* Pop 3, push 1 */
+        case IR_CLAMP_F32: case IR_FMA_F32: case IR_LERP_F32:
+        case IR_SMOOTHSTEP_F32: case IR_STRING_SLICE: case IR_STRING_REPLACE:
+            return -2;
+
+        /* Pop 0, push 0 (control flow markers, or ops acting on a local
+         * by index rather than the stack) */
+        case IR_JUMP: case IR_LABEL: case IR_NOP:
+        case IR_RETURN_VOID:
+        case IR_ADD_LOCAL_CONST:
+            return 0;
+
+        case IR_SWAP:
+            return 0;
+
+        case IR_ARRAY_CLEAR:
+            return -1;
+
+        case IR_CALL: case IR_TAIL_CALL: case IR_CALL_C_FUNC: {
+            /* Indirect calls (func_ptr == NULL) also pop the callee
+             * reference itself, pushed by a preceding IR_CONST_I32 (see
+             * nc_emit_func_ptr_const) - direct calls (IR_CALL_C_FUNC, or
+             * any IR_CALL/IR_TAIL_CALL with a known func_ptr) don't. */
+            int n = instr->operand.call.arg_count;
+            int callee_pop = (instr->op != IR_CALL_C_FUNC && instr->operand.call.func_ptr == NULL) ? 1 : 0;
+            int pushes = (instr->operand.call.ret_type == NATIVE_TYPE_VOID) ? 0 : 1;
+            return pushes - n - callee_pop;
+        }
+
+        /* Everything else covered by the ops above's comments: binary
+         * arithmetic/bitwise/comparison ops (pop 2, push 1). This is the
+         * majority of IROp, so treat it as the default rather than
+         * listing all ~50 of them. */
+        default:
+            return -1;
+    }
+}
+
+/*
+ * Compute, for every block, the eval-stack depth guaranteed to be present
+ * when control reaches it - used so ir_to_native's per-block reset (below)
+ * doesn't blindly assume 0 for blocks that are legitimately entered with a
+ * value already on the stack (e.g. a ternary whose two branches each leave
+ * exactly one value before jumping/falling into their shared continuation -
+ * QuickJS bytecode guarantees every such merge point sees a consistent
+ * depth from all of its predecessors, since that's a basic soundness
+ * requirement of stack-machine bytecode, so it's always safe to adopt
+ * whichever predecessor's exit depth we discover first).
+ *
+ * Block 0 (function entry) always starts empty. Propagation runs as a
+ * fixed-point over at most block_count passes: a predecessor can have a
+ * HIGHER array index than its successor (e.g. the "else" arm of a ternary,
+ * discovered/numbered after the merge point it flows into), so a single
+ * forward sweep isn't enough. Any block never reached this way (dead code,
+ * or a loop header whose only predecessor is its own later back-edge)
+ * defaults to 0, matching the previous unconditional behavior exactly.
+ */
+static void compute_block_entry_depths(const IRFunction *ir, int *entry_depth) {
+    for (int b = 0; b < ir->block_count; b++) entry_depth[b] = -1;
+    if (ir->block_count > 0) entry_depth[0] = 0;
+
+    for (int pass = 0; pass <= ir->block_count; pass++) {
+        bool changed = false;
+        for (int b = 0; b < ir->block_count; b++) {
+            if (entry_depth[b] < 0) continue;  /* not reached yet this pass */
+            int depth = entry_depth[b];
+            const IRBasicBlock *block = &ir->blocks[b];
+            for (int i = 0; i < block->instr_count; i++) {
+                depth += ir_op_stack_delta(&block->instrs[i]);
+                if (depth < 0) depth = 0;  /* defensive clamp, shouldn't happen */
+            }
+            for (int s = 0; s < 2; s++) {
+                int succ = block->successors[s];
+                if (succ >= 0 && succ < ir->block_count && entry_depth[succ] < 0) {
+                    entry_depth[succ] = depth;
+                    changed = true;
+                }
+            }
+        }
+        if (!changed) break;
+    }
+
+    for (int b = 0; b < ir->block_count; b++) {
+        if (entry_depth[b] < 0) entry_depth[b] = 0;
+    }
 }
 
 /*
@@ -6552,21 +7027,29 @@ int ir_to_native(NativeCompiler *nc, const IRFunction *ir) {
         last_return_block = ir->block_count - 1;
     }
     
+    /* Real per-block entry stack depth (a branch target isn't necessarily
+     * empty - e.g. a ternary's two arms each leave one value before
+     * jumping/falling into their shared merge block). Replaces the old
+     * unconditional reset-to-0 below. */
+    int block_entry_depth[NC_MAX_BASIC_BLOCKS];
+    compute_block_entry_depths(ir, block_entry_depth);
+
     /* Emit code for each basic block */
     for (int b = 0; b < ir->block_count; b++) {
         /* Bind block label using the mapped label ID */
         mips_label_bind(em, block_to_label[b]);
-        
+
         IRBasicBlock *block = &ir->blocks[b];
         NC_LOG("emit: block %d/%d instr_count=%d", b, ir->block_count, block->instr_count);
-        
-        /* Reset type stack when entering a branch target (conservative approach) */
+
+        /* Reset type stack when entering a branch target, to whatever
+         * depth is actually guaranteed to be present there. */
         if (is_branch_target[b] && b > 0) {
-            /* CRITICAL: If we reset stack_depth, we should also reset stack_top to keep them in sync */
-            if (nc->stack_top > 0) {
-                nc->stack_top = 0;
-            }
-            nc->stack_depth = 0;  /* Reset type stack for branch targets */
+            int depth = block_entry_depth[b];
+            if (depth < 0) depth = 0;
+            if (depth > 8) depth = 8;  /* $s0-$s7 physical register cap, see nc_push_reg */
+            nc->stack_top = depth;
+            nc->stack_depth = depth;
         }
         
         /* If block is empty and is a branch target, we need to handle it carefully.
@@ -6719,20 +7202,37 @@ int ir_to_native(NativeCompiler *nc, const IRFunction *ir) {
                 }
                 
                 if (emit_ir_instruction(nc, &temp_instr, NULL) < 0) {
+                    NC_LOG("ir_to_native: emit_ir_instruction failed at block=%d instr=%d", b, i);
                     return -1;
                 }
             }
             
-            /* CRITICAL FIX: After emitting a conditional jump, check if we need 
-             * an explicit jump to the semantic fallthrough block.
-             * This handles cases where the physical block order doesn't match
-             * the semantic fallthrough (e.g., Exit block placed before Body block). */
+            /* CRITICAL FIX: check if we need an explicit jump to the semantic
+             * fallthrough block. This handles cases where the physical block
+             * order doesn't match the semantic fallthrough (e.g., Exit block
+             * placed before Body block).
+             *
+             * This used to only fire when the block's last instruction was a
+             * conditional jump (IR_JUMP_IF_FALSE/TRUE), but a block can just
+             * as easily end on an ordinary instruction with no jump at all -
+             * e.g. one arm of a ternary whose result feeds a later call
+             * ends on an IR_STORE_LOCAL, then naturally falls through to
+             * wherever the bytecode's merge point was discovered as a block
+             * (see bytecode_to_ir's main decode loop, which now sets
+             * successors[1] on exactly this kind of fallthrough transition).
+             * Any block whose last instruction ISN'T already an
+             * unconditional terminator (IR_JUMP/IR_RETURN/IR_RETURN_VOID -
+             * those already went where they need to) needs this same check,
+             * not just ones ending in a conditional jump. */
             if (block->instr_count > 0) {
                 IROp last_op = block->instrs[block->instr_count - 1].op;
-                if (last_op == IR_JUMP_IF_FALSE || last_op == IR_JUMP_IF_TRUE) {
+                bool already_terminates = (last_op == IR_JUMP ||
+                                           last_op == IR_RETURN ||
+                                           last_op == IR_RETURN_VOID);
+                if (!already_terminates) {
                     int semantic_fallthrough = block->successors[1];
                     int physical_next = b + 1;
-                    if (semantic_fallthrough >= 0 && 
+                    if (semantic_fallthrough >= 0 &&
                         semantic_fallthrough < ir->block_count &&
                         semantic_fallthrough != physical_next) {
                         /* Physical next block is different from semantic fallthrough.
@@ -6911,6 +7411,7 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
     nc->cpool_count = 0;
     nc->current_js_func = js_func;
     nc->closure_var_count = 0;
+    nc->has_pending_call_sig = false;
     ir_func_free(&nc->ir_func);
     
     /* Initialize IR function (this zeros the sig, but we'll set it below) */
@@ -7020,6 +7521,7 @@ CompileResult native_compile_function(NativeCompiler *nc, JSValueConst js_func,
     
     /* Generate native code */
     if (ir_to_native(nc, &nc->ir_func) < 0) {
+        NC_LOG("native_compile_function: ir_to_native failed, error_msg='%s'", nc->error_msg);
         result.error_msg = nc->error_msg[0] ? nc->error_msg : "Code generation failed";
         nc_free_string_literals(nc);
         return result;
