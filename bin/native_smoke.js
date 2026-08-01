@@ -1084,6 +1084,191 @@ const dbl = compile("helper double", { args: ["int"], returns: "int" }, function
 }
 
 // ---------------------------------------------------------------------------
+// 17. Struct arrays (StructType.array(N))
+// A contiguous run of N struct instances passed into Native.compile as
+// args: [[StructType], "int"] - arr[i].field reads/writes go through
+// IR_ARRAY_ELEM_ADDR + IR_LOAD_FIELD_DYN/IR_STORE_FIELD_DYN, which resolve
+// the struct base pointer from a genuine runtime value on the eval stack
+// instead of a fixed local/argument slot (see IR_LOAD_FIELD/IR_STORE_FIELD,
+// which can only ever address a single struct passed directly as an arg).
+// ---------------------------------------------------------------------------
+{
+    const Vec = attempt("struct Vec (array)", function () {
+        return Native.struct({ x: "float", y: "float" });
+    });
+
+    if (Vec) {
+        const va1 = attempt("Vec.array(4) #1", function () { return Vec.array(4); });
+        if (va1) {
+            va1[2].x = 5.5;
+            const readAt2 = compile("struct array read[2]", { args: [[Vec], "int"], returns: "float" },
+                function (arr, n) { return arr[2].x; });
+            if (readAt2) eq("17.1 struct array read (JS write -> native read)", readAt2(va1, 4), 5.5);
+        }
+
+        const va2 = attempt("Vec.array(4) #2", function () { return Vec.array(4); });
+        if (va2) {
+            const writeAt = compile("struct array write[1]", { args: [[Vec], "int"], returns: "void" },
+                function (arr, n) { arr[1].y = 9.5f; });
+            if (writeAt) {
+                writeAt(va2, 4);
+                eq("17.2 struct array write (native write -> JS read)", va2[1].y, 9.5);
+            }
+        }
+
+        // The main target use case: one native call looping over N struct
+        // elements, instead of N separate JS<->native crossings.
+        const va3 = attempt("Vec.array(4) #3", function () { return Vec.array(4); });
+        if (va3) {
+            for (let i = 0; i < 4; i++) { va3[i].x = i * 1.0; va3[i].y = i * 2.0; }
+            const sumLoop = compile("struct array loop sum", { args: [[Vec], "int"], returns: "float" },
+                function (arr, n) {
+                    let s = 0.0f;
+                    for (let i = 0; i < n; i++) s = s + arr[i].x + arr[i].y;
+                    return s;
+                });
+            if (sumLoop) {
+                let want = 0;
+                for (let i = 0; i < 4; i++) want += i * 1.0 + i * 2.0;
+                eq("17.3 struct array loop + accumulator", sumLoop(va3, 4), want);
+            }
+        }
+
+        const va4 = attempt("Vec.array(1) boundary", function () { return Vec.array(1); });
+        if (va4) {
+            va4[0].x = 42.0;
+            const boundaryLoop = compile("struct array boundary loop", { args: [[Vec], "int"], returns: "float" },
+                function (arr, n) {
+                    let s = 0.0f;
+                    for (let i = 0; i < n; i++) s = s + arr[i].x;
+                    return s;
+                });
+            if (boundaryLoop) {
+                eq("17.4 struct array loop, zero trips (n=0)", boundaryLoop(va4, 0), 0.0);
+                eq("17.5 struct array loop, one trip (n=1)", boundaryLoop(va4, 1), 42.0);
+            }
+        }
+
+        // [reg] Whole-number float literals reach the compiler as the same
+        // compact integer-push opcode as a plain int (section 2 above) -
+        // exercise that path through a dynamically-indexed struct field too.
+        const va5 = attempt("Vec.array(3) whole literal", function () { return Vec.array(3); });
+        if (va5) {
+            const wholeWrite = compile("struct array whole literal write", { args: [[Vec], "int"], returns: "void" },
+                function (arr, n) {
+                    for (let i = 0; i < n; i++) arr[i].x = 5.0f;
+                });
+            if (wholeWrite) {
+                wholeWrite(va5, 3);
+                eq("17.6 [reg] whole-number float literal through arr[i].field", va5[1].x, 5.0);
+            }
+        }
+
+        // [reg] arr[i].x = arr[i].x + arr[i].vx: the RHS re-reads the same
+        // index (via its own IR_ARRAY_ELEM_ADDR calls) before the LHS write
+        // consumes the original element address. IR_STORE_ARRAY needed an
+        // explicit reload fallback for exactly this shape with scalar
+        // typed arrays (result[i] = a[i] + b[i]); this is the struct-field
+        // analogue, and the highest-risk case for this feature.
+        const Vec2 = attempt("struct Vec2 (velocity)", function () {
+            return Native.struct({ x: "float", vx: "float" });
+        });
+        if (Vec2) {
+            const va6 = attempt("Vec2.array(3)", function () { return Vec2.array(3); });
+            if (va6) {
+                for (let i = 0; i < 3; i++) { va6[i].x = i * 1.0; va6[i].vx = 0.5; }
+                const selfUpdate = compile("struct array self-referencing write",
+                    { args: [[Vec2], "int"], returns: "void" },
+                    function (arr, n) {
+                        for (let i = 0; i < n; i++) arr[i].x = arr[i].x + arr[i].vx;
+                    });
+                if (selfUpdate) {
+                    selfUpdate(va6, 3);
+                    eq("17.7 [reg] arr[i].x = arr[i].x + arr[i].vx", va6[2].x, 2.0 + 0.5);
+                }
+            }
+        }
+
+        // [reg] Reproduces starfox.js's bullet-update shape: a struct mixing
+        // FIVE float fields with ONE int field (every prior struct-array case
+        // above is float-only), array-length 40 (larger than anything above),
+        // and a loop body touching the same element FIVE separate times
+        // (read, write, write, read again for the guard, conditional write) -
+        // more struct-array field ops per iteration than any case above.
+        // Caught a real crash: starfox.js reported "Address Error" at tiny
+        // addresses (0x15/0x16) after a few seconds of live bullets, not
+        // reproduced by any single-field-op-per-iteration case.
+        const N8 = 40;
+        const Bullet = attempt("struct Bullet (mixed float/int)", function () {
+            return Native.struct({ x: "float", y: "float", z: "float", pz: "float", damage: "float", alive: "int" });
+        });
+        if (Bullet) {
+            const va8 = attempt("Bullet.array(40)", function () { return Bullet.array(N8); });
+            if (va8) {
+                for (let i = 0; i < N8; i++) {
+                    va8[i].x = i * 1.0f; va8[i].y = 0.0f; va8[i].z = 100.0f + i;
+                    va8[i].pz = 100.0f + i; va8[i].damage = 1.0f; va8[i].alive = 1;
+                }
+                const stepBullets8 = compile("struct array bullet step", { args: [[Bullet], "int"], returns: "void" },
+                    function (arr, n) {
+                        for (let i = 0; i < n; i++) {
+                            if (arr[i].alive === 0) continue;
+                            arr[i].pz = arr[i].z;
+                            arr[i].z = arr[i].z + 3.4f;
+                            if (arr[i].z > 135.0f) arr[i].alive = 0;
+                        }
+                    });
+                if (stepBullets8) {
+                    // Several frames, same as a real game loop, so any
+                    // accumulated-state bug (not just a first-call one) shows up.
+                    for (let frame = 0; frame < 20; frame++) stepBullets8(va8, N8);
+                    let allOk = true, sample = -1;
+                    for (let i = 0; i < N8; i++) {
+                        // Don't try to match an exact step count or overshoot
+                        // bound - both depend on how many 3.4 increments run
+                        // before crossing 135, which varies per i (some start
+                        // past 135 already, at i=35+, since z0 = 100+i), and
+                        // float32 vs double accumulate differently besides.
+                        // Just check the loop's actual invariant: alive===0
+                        // iff z ran past 135, and z landed somewhere a real
+                        // sequence of +3.4 steps from 100+i could reach (i.e.
+                        // not corrupted into a garbage value).
+                        const z = va8[i].z, alive = va8[i].alive;
+                        const wantAlive = z > 135.0 ? 0 : 1;
+                        if (alive !== wantAlive || z < 100.0 + i - 0.01 || z > 100.0 + i + 20 * 3.4 + 0.01) {
+                            allOk = false; sample = i; break;
+                        }
+                    }
+                    ok("17.8 [reg] mixed float/int struct array, N=40, 20 frames", allOk,
+                        sample >= 0 ? `first mismatch at i=${sample}: z=${va8[sample].z}, alive=${va8[sample].alive}` : undefined);
+
+                    // Plain-JS arr[i].field traffic (not Native.compile), a handful
+                    // of "frames" - correctness check only, NOT a stress/timing
+                    // test (see the file-level note: wall-clock loops make this
+                    // suite flaky). Each arr[i] access allocates a fresh element-
+                    // view JSObject (see js_struct_instance_array_get_own_property),
+                    // so this same access pattern at real game scale (syncScene/
+                    // renderScene read bulletData[i].x/y/z every alive bullet,
+                    // every frame) is expensive - that's a starfox.js perf/design
+                    // question, not something to chase inside the regression suite.
+                    for (let i = 0; i < N8; i++) { va8[i].alive = 1; va8[i].x = i * 1.0f; va8[i].y = i * 2.0f; va8[i].z = i * 3.0f; }
+                    let expected = 0.0;
+                    for (let i = 0; i < N8; i++) expected += i * 1.0 + i * 2.0 + i * 3.0;
+                    let sum = 0.0;
+                    for (let frame = 0; frame < 3; frame++) {
+                        sum = 0.0;
+                        for (let i = 0; i < N8; i++) {
+                            if (va8[i].alive !== 0) sum += va8[i].x + va8[i].y + va8[i].z;
+                        }
+                    }
+                    eq("17.9 [reg] plain-JS struct array field access", sum, expected, 0.01);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 console.log("");

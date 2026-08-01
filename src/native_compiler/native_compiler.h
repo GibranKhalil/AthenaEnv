@@ -166,10 +166,18 @@
      IR_F32_TO_I64,      /* Float to 64-bit int */
      
      /* Struct field access */
-     IR_LOAD_FIELD,      /* Load field: pop base ptr, push value at offset */
-     IR_STORE_FIELD,     /* Store field: pop value, pop base ptr, write at offset */
+     IR_LOAD_FIELD,      /* Load field: base ptr resolved from operand.field.local_idx, push value at offset */
+     IR_STORE_FIELD,     /* Store field: pop value, base ptr resolved from operand.field.local_idx, write at offset */
      IR_LOAD_FIELD_ADDR, /* Load field address: push base + offset (for array fields) */
-     
+
+     /* Struct ARRAY field access: unlike IR_LOAD_FIELD/IR_STORE_FIELD above,
+      * the struct base pointer here is a genuine runtime value already on
+      * the eval stack (produced by IR_ARRAY_ELEM_ADDR), not a fixed
+      * local/argument slot - see OP_get_array_el's struct-array branch. */
+     IR_ARRAY_ELEM_ADDR, /* Struct array indexing: pop index, pop base ptr, push base + index*elem_size */
+     IR_LOAD_FIELD_DYN,  /* Load field: pop base ptr, push value at offset */
+     IR_STORE_FIELD_DYN, /* Store field: pop value, pop base ptr, write at offset */
+
      /* Control flow */
      IR_JUMP,            /* Unconditional jump */
      IR_JUMP_IF_TRUE,    /* Conditional jump if true */
@@ -222,7 +230,13 @@
              int16_t offset;      /* Byte offset from base pointer */
              int16_t local_idx;   /* Local variable holding the base pointer */
              NativeType field_type;  /* Type of the field (for load/store size) */
-         } field;  /* For IR_LOAD_FIELD / IR_STORE_FIELD */
+         } field;  /* For IR_LOAD_FIELD / IR_STORE_FIELD / IR_LOAD_FIELD_ADDR.
+                    * Also reused by IR_LOAD_FIELD_DYN / IR_STORE_FIELD_DYN
+                    * (offset + field_type only; local_idx unused, base comes
+                    * off the eval stack instead - see IR_ARRAY_ELEM_ADDR). */
+         struct {
+             int32_t elem_size;   /* sizeof(struct) - compile-time constant multiplier */
+         } array_elem;  /* For IR_ARRAY_ELEM_ADDR */
      } operand;
     
     /* Track which local this instruction loaded (for struct field access)
@@ -369,7 +383,26 @@
      struct NativeStructDef *local_struct_defs[NC_MAX_LOCALS];  /* Struct def for each struct-typed local */
      int last_loaded_local;  /* Index of last loaded local (for getter) */
      int last_put_field_target;  /* Index of target for next put_field (not reset by getters) */
-     
+
+     /* Pushed by OP_get_array_el/OP_get_array_el2 when the indexed local is a
+      * struct array (nc_arg_is_struct_array): holds the ELEMENT struct def so
+      * the matching OP_get_field/OP_put_field knows to consume the
+      * IR_ARRAY_ELEM_ADDR result already on the eval stack (IR_LOAD_FIELD_DYN/
+      * IR_STORE_FIELD_DYN) instead of the fixed-local-slot IR_LOAD_FIELD/
+      * IR_STORE_FIELD path, then pops it.
+      *
+      * A single pending slot breaks as soon as one struct-array field access
+      * appears inside another's containing expression - e.g.
+      * `arr[i].x = arr[i].x + arr[i].vx`: the LHS's `arr[i]` pushes first,
+      * but two more complete `arr[i].field` reads (for the RHS) push AND pop
+      * their own entries before the LHS's put_field ever runs, so a single
+      * slot would already be cleared by the time the LHS needs it. Same
+      * failure mode pending_intrinsic_stack below exists to avoid for
+      * Math.atan2(Math.sqrt(...)) - LIFO stack, not a single slot. */
+     struct NativeStructDef *pending_struct_elem_stack[NC_MAX_PENDING_INTRINSICS];
+     int pending_struct_elem_depth;
+
+
      /* Track which local each stack item came from for field access resolution */
      int stack_local_source[NC_MAX_STACK_DEPTH];  /* Which local does each stack item come from? -1 if unknown */
  } NativeCompiler;

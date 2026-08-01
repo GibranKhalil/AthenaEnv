@@ -252,7 +252,42 @@ static int infer_block_types(IRBasicBlock *block, NativeType *local_types,
                 type_stack_pop(stack);
                 instr->type = NATIVE_TYPE_VOID;
                 break;
-                
+
+            case IR_ARRAY_ELEM_ADDR:
+                /* Struct array indexing: pop index, pop base, push the
+                 * element address as a plain pointer - mirrors the real
+                 * codegen exactly (native_compiler.c), unlike IR_LOAD_ARRAY's
+                 * entry above which pushes the ARRAY's declared element type.
+                 * A struct element isn't representable as one scalar type,
+                 * so this always pushes NATIVE_TYPE_PTR regardless of what
+                 * struct type it addresses - the field type only becomes
+                 * known at the following IR_LOAD_FIELD_DYN/IR_STORE_FIELD_DYN. */
+                type_stack_pop(stack);  /* index */
+                type_stack_pop(stack);  /* base */
+                type_stack_push(stack, NATIVE_TYPE_PTR);
+                instr->type = NATIVE_TYPE_PTR;
+                break;
+
+            case IR_LOAD_FIELD_DYN:
+                /* Same as IR_LOAD_FIELD: push using the type already baked
+                 * into the instruction at construction time (the struct
+                 * field's declared type) - see the [reg] comment on
+                 * IR_LOAD_FIELD/IR_LOAD_FIELD_ADDR above for why this must
+                 * NOT be recomputed here. Pop the base pointer (the one real
+                 * difference from IR_LOAD_FIELD: base comes off the stack
+                 * instead of a fixed local). */
+                type_stack_pop(stack);  /* base ptr */
+                type_stack_push(stack, instr->type);
+                break;
+
+            case IR_STORE_FIELD_DYN:
+                /* Pop value, pop base ptr (the one real difference from
+                 * IR_STORE_FIELD, which only pops the value). */
+                type_stack_pop(stack);  /* value */
+                type_stack_pop(stack);  /* base ptr */
+                instr->type = NATIVE_TYPE_VOID;
+                break;
+
             /* Binary integer operations */
             case IR_ADD_I32:
             case IR_SUB_I32:
@@ -872,6 +907,28 @@ int infer_types(IRFunction *ir, const NativeFuncSignature *sig) {
                         if (stack.depth > 0) type_stack_pop(&stack);
                         instr->type = NATIVE_TYPE_VOID;
                         break;
+                    case IR_ARRAY_ELEM_ADDR:
+                        if (stack.depth >= 2) {
+                            type_stack_pop(&stack);  /* index */
+                            type_stack_pop(&stack);  /* base */
+                        }
+                        type_stack_push(&stack, NATIVE_TYPE_PTR);
+                        instr->type = NATIVE_TYPE_PTR;
+                        break;
+                    case IR_LOAD_FIELD_DYN:
+                        /* Same reasoning as IR_LOAD_FIELD/IR_LOAD_FIELD_ADDR
+                         * above: preserve the already-correct type baked in
+                         * at construction time, don't recompute it here. */
+                        if (stack.depth > 0) type_stack_pop(&stack);  /* base ptr */
+                        type_stack_push(&stack, instr->type);
+                        break;
+                    case IR_STORE_FIELD_DYN:
+                        if (stack.depth >= 2) {
+                            type_stack_pop(&stack);  /* value */
+                            type_stack_pop(&stack);  /* base ptr */
+                        }
+                        instr->type = NATIVE_TYPE_VOID;
+                        break;
                     case IR_STORE_ARRAY:
                         if (stack.depth >= 3) {
                             type_stack_pop(&stack);  /* value */
@@ -1067,6 +1124,7 @@ const char *native_type_name(NativeType type) {
         case NATIVE_TYPE_UINT32_ARRAY: return "Uint32Array";
         case NATIVE_TYPE_FLOAT32_ARRAY: return "Float32Array";
         case NATIVE_TYPE_PTR: return "ptr";
+        case NATIVE_TYPE_STRUCT_ARRAY: return "StructArray";
         case NATIVE_TYPE_STRING: return "string";
         case NATIVE_TYPE_STRING_VIEW: return "StringView";
         case NATIVE_TYPE_DYNAMIC_INT32_ARRAY: return "DynamicInt32Array";
@@ -1088,6 +1146,7 @@ size_t native_type_size(NativeType type) {
         case NATIVE_TYPE_BOOL:
         case NATIVE_TYPE_FLOAT32:
         case NATIVE_TYPE_PTR:
+        case NATIVE_TYPE_STRUCT_ARRAY:
             return 4;  /* 32 bits = 4 bytes */
         case NATIVE_TYPE_INT64:
         case NATIVE_TYPE_UINT64:
@@ -1122,6 +1181,7 @@ size_t native_type_alignment(NativeType type) {
         case NATIVE_TYPE_BOOL:
         case NATIVE_TYPE_FLOAT32:
         case NATIVE_TYPE_PTR:
+        case NATIVE_TYPE_STRUCT_ARRAY:
         default:
             return 4;  /* Default 4-byte alignment */
     }

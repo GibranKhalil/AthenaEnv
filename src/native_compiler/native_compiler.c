@@ -18,6 +18,7 @@
 
 /* Extern from ath_native.c for struct instance detection */
 extern JSClassID js_struct_class_id;
+extern JSClassID js_struct_instance_array_class_id;
 
 #ifdef PS2
 #include <kernel.h>
@@ -404,6 +405,31 @@ static bool nc_is_dynamic_array(NativeType t) {
     return t == NATIVE_TYPE_DYNAMIC_INT32_ARRAY ||
            t == NATIVE_TYPE_DYNAMIC_UINT32_ARRAY ||
            t == NATIVE_TYPE_DYNAMIC_FLOAT32_ARRAY;
+}
+
+/* Struct arrays can ONLY ever be function arguments (there is no bytecode
+ * path that declares a struct-array-typed local variable), so this checks
+ * ir->sig.arg_types[] directly rather than nc_get_local_type()/
+ * ir->local_types[]. That table is NOT reliably populated during
+ * bytecode_to_ir: native_compile_function only copies sig->arg_types[] into
+ * ir_func.local_types[] AFTER bytecode_to_ir returns ("Initialize locals
+ * from signature - do this BEFORE type inference"), and OP_get_arg0-3 (the
+ * compact opcodes QuickJS actually emits for small arg counts) never bump
+ * local_count either. So during THIS pass - exactly when OP_get_array_el
+ * needs the answer - ir->local_types[idx] for an argument is still
+ * NATIVE_TYPE_UNKNOWN. (The pre-existing nc_is_dynamic_array(lt) check a few
+ * lines below OP_get_array_el's struct-array branch has the same timing
+ * problem, but gets away with it silently: IR_LOAD_ARRAY/IR_STORE_ARRAY's
+ * codegen has its own correct dynamic-array detection, from the properly-
+ * inferred type stack at codegen time, as a fallback. A struct can't fall
+ * back like that - there's no scalar interpretation of "load a struct".)
+ * ir->sig itself IS reliable throughout: it's set from the real signature
+ * before bytecode_to_ir is even called, and preserved across the
+ * ir_func_init() reset inside it (see the saved_sig dance at the top of
+ * bytecode_to_ir). */
+static bool nc_arg_is_struct_array(const IRFunction *ir, int idx) {
+    return ir && idx >= 0 && idx < ir->sig.arg_count &&
+           ir->sig.arg_types[idx] == NATIVE_TYPE_STRUCT_ARRAY;
 }
 
 static NativeType nc_dynamic_elem(NativeType t) {
@@ -992,6 +1018,18 @@ static int optimize_ir_dead_code(IRFunction *ir) {
                 case IR_TAIL_CALL:
                 case IR_CALL_C_FUNC:
                 case IR_ADD_LOCAL_CONST:
+                /* Struct-array field access: this pass predates these ops and
+                 * never learned to recognize them as consumers below, so a
+                 * CONST feeding IR_STORE_FIELD_DYN with no other whitelisted
+                 * op later in the same block (e.g. the true-branch of an if,
+                 * which falls through instead of jumping) was wrongly judged
+                 * dead and stripped to IR_NOP - leaving STORE_FIELD_DYN one
+                 * stack value short, so it popped the ARRAY_ELEM_ADDR result
+                 * as "value" and underflowed into a garbage register for
+                 * "base". [reg] see native_smoke.js 17.8/17.9. */
+                case IR_ARRAY_ELEM_ADDR:
+                case IR_LOAD_FIELD_DYN:
+                case IR_STORE_FIELD_DYN:
                     needed[i] = true;
                     break;
                     
@@ -1565,6 +1603,7 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
     
     /* Initialize field access tracking */
     nc->last_loaded_local = -1;
+    nc->pending_struct_elem_depth = 0;
     for (int i = 0; i < NC_MAX_STACK_DEPTH; i++) {
         nc->stack_local_source[i] = -1;
     }
@@ -2782,7 +2821,30 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
             /* Array access */
             case OP_get_array_el: {
                 NativeType lt = nc_get_local_type(ir_out, nc->last_loaded_local);
-                if (nc_is_dynamic_array(lt)) {
+                struct NativeStructDef *elem_def =
+                    (nc->last_loaded_local >= 0 && nc->last_loaded_local < NC_MAX_LOCALS)
+                    ? nc->local_struct_defs[nc->last_loaded_local] : NULL;
+                if (nc_arg_is_struct_array(ir_out, nc->last_loaded_local) && elem_def) {
+                    /* arr[i] on a struct array: push the ELEMENT ADDRESS, not a
+                     * loaded scalar. The matching OP_get_field/OP_put_field
+                     * pops it off pending_struct_elem_stack - a stack, not a
+                     * single slot, because arr[i]'s own field access can have
+                     * OTHER complete arr[j].field reads nested inside it
+                     * before that happens (arr[i].x = arr[i].x + arr[i].vx) -
+                     * see the struct comment on pending_struct_elem_stack. */
+                    if (nc->pending_struct_elem_depth < NC_MAX_PENDING_INTRINSICS) {
+                        IRInstr instr = { .op = IR_ARRAY_ELEM_ADDR, .type = NATIVE_TYPE_PTR };
+                        instr.operand.array_elem.elem_size = (int32_t)elem_def->size;
+                        ir_emit(ir_out, current_block, &instr);
+                        nc->pending_struct_elem_stack[nc->pending_struct_elem_depth++] = elem_def;
+                    } else {
+                        nc->has_error = true;
+                        snprintf(nc->error_msg, sizeof(nc->error_msg),
+                                 "Struct array field access nested too deeply (max %d)",
+                                 NC_MAX_PENDING_INTRINSICS);
+                        return -1;
+                    }
+                } else if (nc_is_dynamic_array(lt)) {
                     IRInstr instr = {
                         .op = IR_ARRAY_GET,
                         .type = nc_dynamic_elem(lt),
@@ -2795,10 +2857,26 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 }
                 break;
             }
-            
+
             case OP_get_array_el2: {
                 NativeType lt = nc_get_local_type(ir_out, nc->last_loaded_local);
-                if (nc_is_dynamic_array(lt)) {
+                struct NativeStructDef *elem_def =
+                    (nc->last_loaded_local >= 0 && nc->last_loaded_local < NC_MAX_LOCALS)
+                    ? nc->local_struct_defs[nc->last_loaded_local] : NULL;
+                if (nc_arg_is_struct_array(ir_out, nc->last_loaded_local) && elem_def) {
+                    if (nc->pending_struct_elem_depth < NC_MAX_PENDING_INTRINSICS) {
+                        IRInstr instr = { .op = IR_ARRAY_ELEM_ADDR, .type = NATIVE_TYPE_PTR };
+                        instr.operand.array_elem.elem_size = (int32_t)elem_def->size;
+                        ir_emit(ir_out, current_block, &instr);
+                        nc->pending_struct_elem_stack[nc->pending_struct_elem_depth++] = elem_def;
+                    } else {
+                        nc->has_error = true;
+                        snprintf(nc->error_msg, sizeof(nc->error_msg),
+                                 "Struct array field access nested too deeply (max %d)",
+                                 NC_MAX_PENDING_INTRINSICS);
+                        return -1;
+                    }
+                } else if (nc_is_dynamic_array(lt)) {
                     IRInstr instr = {
                         .op = IR_ARRAY_GET,
                         .type = nc_dynamic_elem(lt),
@@ -2811,10 +2889,21 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 }
                 break;
             }
-            
+
             case OP_put_array_el: {
                 NativeType lt = nc_get_local_type(ir_out, nc->last_loaded_local);
-                if (nc_is_dynamic_array(lt)) {
+                if (nc_arg_is_struct_array(ir_out, nc->last_loaded_local)) {
+                    /* Whole-element assignment (arr[i] = someStruct) is out of
+                     * scope: it would need a memcpy-shaped op. Fail the compile
+                     * instead of silently falling through to the scalar
+                     * IR_STORE_ARRAY path, which would corrupt memory. */
+                    nc->has_error = true;
+                    snprintf(nc->error_msg, sizeof(nc->error_msg),
+                             "Whole-element assignment to a struct array is not "
+                             "supported - assign individual fields instead "
+                             "(arr[i].field = value)");
+                    return -1;
+                } else if (nc_is_dynamic_array(lt)) {
                     IRInstr instr = {
                         .op = IR_ARRAY_SET,
                         .type = NATIVE_TYPE_VOID,
@@ -2978,8 +3067,48 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 /* OP_get_field: obj -> value
                  * Use last_loaded_local to find which struct the object came from */
                 bool found_field = false;
-                
-                if (nc->js_ctx && nc->last_loaded_local >= 0 && nc->last_loaded_local < NC_MAX_LOCALS) {
+
+                if (nc->js_ctx && nc->pending_struct_elem_depth > 0) {
+                    /* obj on the stack is a REAL runtime pointer - the result of
+                     * IR_ARRAY_ELEM_ADDR for arr[i] on a struct array - not a
+                     * placeholder tied to a fixed local. Consume it as the base
+                     * for IR_LOAD_FIELD_DYN instead of taking the local_idx path
+                     * below (which would try to re-derive a base register from
+                     * last_loaded_local, which here refers to the ARRAY local,
+                     * not a single struct instance). Pop from the TOP of the
+                     * stack: this field access always matches the MOST
+                     * RECENTLY pushed arr[i] (LIFO, same as the real eval
+                     * stack it mirrors). */
+                    struct NativeStructDef *def =
+                        nc->pending_struct_elem_stack[nc->pending_struct_elem_depth - 1];
+                    const char *name = JS_AtomToCString(nc->js_ctx, (JSAtom)atom);
+                    if (name) {
+                        for (int f = 0; f < def->field_count; f++) {
+                            if (strcmp(def->fields[f].name, name) == 0) {
+                                /* Array-typed fields inside a struct-array element
+                                 * are out of scope for this pass (would need to
+                                 * combine a dynamic base with IR_LOAD_FIELD_ADDR's
+                                 * fixed-local assumption) - treat as not found. */
+                                if (!(def->fields[f].flags & FIELD_FLAG_ARRAY)) {
+                                    IRInstr instr = {
+                                        .op = IR_LOAD_FIELD_DYN,
+                                        .type = def->fields[f].type,
+                                        .operand.field = {
+                                            .offset = def->fields[f].offset,
+                                            .local_idx = -1,
+                                            .field_type = def->fields[f].type
+                                        }
+                                    };
+                                    ir_emit(ir_out, current_block, &instr);
+                                    found_field = true;
+                                }
+                                break;
+                            }
+                        }
+                        JS_FreeCString(nc->js_ctx, name);
+                    }
+                    nc->pending_struct_elem_depth--;
+                } else if (nc->js_ctx && nc->last_loaded_local >= 0 && nc->last_loaded_local < NC_MAX_LOCALS) {
                     const char *name = JS_AtomToCString(nc->js_ctx, (JSAtom)atom);
                     if (name) {
                         if (strcmp(name, "length") == 0) {
@@ -3082,6 +3211,12 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 nc->pending_intrinsic_entry = NULL;
                 nc->pending_intrinsic_elem_type = NATIVE_TYPE_UNKNOWN;
                 nc->pending_intrinsic_is_method = false;
+
+                /* Method calls on a dynamically-indexed struct-array element
+                 * (arr[i].method()) are out of scope for this pass - pop
+                 * rather than leave it pushed, so a later, unrelated
+                 * OP_get_field/OP_put_field doesn't consume a stale entry. */
+                if (nc->pending_struct_elem_depth > 0) nc->pending_struct_elem_depth--;
 
                 if (nc->js_ctx) {
                     const char *name = JS_AtomToCString(nc->js_ctx, (JSAtom)atom);
@@ -3197,11 +3332,63 @@ int bytecode_to_ir(NativeCompiler *nc, const uint8_t *bytecode,
                 pc += 4;
                 
                 bool found_field = false;
-                
+
+                if (nc->js_ctx && nc->pending_struct_elem_depth > 0) {
+                    /* arr[i].field = value, where arr[i] came from
+                     * IR_ARRAY_ELEM_ADDR. Unlike the fixed-argument case below,
+                     * there is no local register to re-derive the base pointer
+                     * from - the element address only exists as a runtime value
+                     * that IR_ARRAY_ELEM_ADDR pushed onto the eval stack earlier
+                     * in this same expression. IR_STORE_FIELD_DYN pops BOTH the
+                     * value and that base pointer (unlike IR_STORE_FIELD, which
+                     * pops only the value and resolves base via local_idx).
+                     * Pop the TOP of the stack: any RHS-side arr[j].field reads
+                     * nested inside the value expression already pushed AND
+                     * popped their own entries by the time this runs (see the
+                     * struct comment on pending_struct_elem_stack), so what's
+                     * left on top is this statement's own LHS target. */
+                    struct NativeStructDef *def =
+                        nc->pending_struct_elem_stack[nc->pending_struct_elem_depth - 1];
+                    const char *name = JS_AtomToCString(nc->js_ctx, (JSAtom)atom);
+                    if (name) {
+                        for (int f = 0; f < def->field_count; f++) {
+                            if (strcmp(def->fields[f].name, name) == 0) {
+                                if (!(def->fields[f].flags & FIELD_FLAG_ARRAY)) {
+                                    IRInstr instr = {
+                                        .op = IR_STORE_FIELD_DYN,
+                                        .type = NATIVE_TYPE_VOID,
+                                        .operand.field = {
+                                            .offset = def->fields[f].offset,
+                                            .local_idx = -1,
+                                            .field_type = def->fields[f].type
+                                        }
+                                    };
+                                    ir_emit(ir_out, current_block, &instr);
+                                    found_field = true;
+                                }
+                                break;
+                            }
+                        }
+                        JS_FreeCString(nc->js_ctx, name);
+                    }
+                    nc->pending_struct_elem_depth--;
+
+                    if (!found_field) {
+                        /* Unknown/array field - DROP value, DROP base ptr */
+                        IRInstr drop1 = { .op = IR_DROP, .type = NATIVE_TYPE_VOID };
+                        ir_emit(ir_out, current_block, &drop1);
+                        IRInstr drop2 = { .op = IR_DROP, .type = NATIVE_TYPE_VOID };
+                        ir_emit(ir_out, current_block, &drop2);
+                    }
+
+                    nc->last_loaded_local = -1;
+                    break;
+                }
+
                 /* QuickJS doesn't load target before OP_put_field in bytecode!
                  * Use heuristic: scan all struct locals, prefer LAST match (output convention) */
                 int base_local = -1;
-                
+
                 if (nc->js_ctx) {
                     const char *field_name = JS_AtomToCString(nc->js_ctx, (JSAtom)atom);
                     if (field_name) {
@@ -4410,7 +4597,46 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             }
             break;
         }
-        
+
+        case IR_ARRAY_ELEM_ADDR: {
+            /* Struct array indexing (arr[i] where arr is a struct-array
+             * argument): push the ADDRESS of the i-th element, not a loaded
+             * scalar - a struct element can't be loaded into one register.
+             * Stack: [base, index] -> [element_addr], same push/pop order as
+             * IR_LOAD_ARRAY above (base pushed first, index on top).
+             *
+             * elem_size (sizeof the struct) is a compile-time constant but
+             * general - e.g. a 3-float struct is 12 bytes, not a power of 2 -
+             * so this always does a real MULT/MFLO like IR_MUL_I32, rather
+             * than the shift-based strength reduction peephole (which only
+             * fires for a literal IR_CONST_I32 immediately preceding an
+             * IR_MUL_I32 in the bytecode stream; the constant here is baked
+             * into this op's operand instead, so that peephole never sees it). */
+            MipsReg idx_reg = POP_REG();
+            NativeType idx_type = POP_TYPE(); (void)idx_type;
+            MipsReg base_reg = POP_REG();
+            NativeType base_type = POP_TYPE(); (void)base_type;
+
+            /* PUSH_REG() reclaims the eval-stack slot base_reg just vacated,
+             * so a freshly-pushed dst can be the SAME physical register as
+             * base_reg. Finish every read of base_reg (and idx_reg) into a
+             * scratch GPR - one that can't alias either, since mips_alloc_gpr
+             * comes from a separate temp pool - before calling PUSH_REG(),
+             * or the later add would silently read back its own just-written
+             * result instead of the original base pointer. */
+            MipsReg size_reg = mips_alloc_gpr(em);
+            mips_li(em, size_reg, instr->operand.array_elem.elem_size);
+            mips_mult(em, idx_reg, size_reg);
+            mips_mflo(em, size_reg);
+            mips_addu(em, size_reg, size_reg, base_reg);
+
+            MipsReg dst = PUSH_REG();
+            mips_move(em, dst, size_reg);
+            mips_free_gpr(em, size_reg);
+            PUSH_TYPE(NATIVE_TYPE_PTR);
+            break;
+        }
+
         case IR_STORE_ARRAY: {
             /* Stack: [base, index, value] -> []
              * QuickJS: sp[-3] = base, sp[-2] = index, sp[-1] = value
@@ -5539,8 +5765,26 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             /* Pop the value to store */
             MipsReg value_reg = POP_REG();
             NativeType value_type = POP_TYPE();
-            (void)value_type;
-            
+
+            /* Whole-number float literals (e.g. `5.0f`) reach the compiler
+             * as the same compact integer-push opcode as a plain int
+             * (IR_CONST_I32, not IR_CONST_F32 - see the file-level [reg]
+             * comment on this class of bug). Reinterpreting int 5's raw bits
+             * as float32 gives a denormal near zero, not 5.0 - only 0 is a
+             * degenerate case where the int and float32 bit patterns happen
+             * to coincide, which is why this went uncaught until a non-zero
+             * literal was stored through a struct field. Convert the VALUE
+             * (CVT.S.W), don't just move the bits. */
+            if (field_type == NATIVE_TYPE_FLOAT32 &&
+                (value_type == NATIVE_TYPE_INT32 || value_type == NATIVE_TYPE_UINT32 ||
+                 value_type == NATIVE_TYPE_BOOL)) {
+                MipsFpuReg fconv = mips_alloc_fpr(em);
+                mips_mtc1(em, value_reg, fconv);
+                mips_cvt_s_w(em, fconv, fconv);
+                mips_mfc1(em, value_reg, fconv);
+                mips_free_fpr(em, fconv);
+            }
+
             /* Get base pointer - use local_regs directly if available to avoid conflicts */
             MipsReg base_reg;
             bool need_free = false;
@@ -5587,7 +5831,90 @@ static int emit_ir_instruction(NativeCompiler *nc, const IRInstr *instr, const i
             }
             break;
         }
-        
+
+        case IR_LOAD_FIELD_DYN: {
+            /* Load a field through a struct-array element address that is a
+             * genuine runtime value on the eval stack (pushed by
+             * IR_ARRAY_ELEM_ADDR), unlike IR_LOAD_FIELD which always
+             * re-derives its base pointer from a fixed local/argument slot.
+             * Stack: [base_ptr] -> [value] */
+            int16_t offset = instr->operand.field.offset;
+            NativeType field_type = instr->operand.field.field_type;
+
+            MipsReg base_reg = POP_REG();
+            NativeType base_type = POP_TYPE(); (void)base_type;
+
+            MipsReg dst = PUSH_REG();
+            switch (field_type) {
+                case NATIVE_TYPE_INT32:
+                case NATIVE_TYPE_UINT32:
+                case NATIVE_TYPE_BOOL:
+                case NATIVE_TYPE_PTR:
+                    mips_lw(em, dst, offset, base_reg);
+                    break;
+                case NATIVE_TYPE_FLOAT32:
+                    mips_lw(em, dst, offset, base_reg);
+                    break;
+                case NATIVE_TYPE_INT64:
+                case NATIVE_TYPE_UINT64:
+                    mips_ld(em, dst, offset, base_reg);
+                    break;
+                default:
+                    mips_lw(em, dst, offset, base_reg);
+                    break;
+            }
+            PUSH_TYPE(field_type);
+            break;
+        }
+
+        case IR_STORE_FIELD_DYN: {
+            /* Store a field through a struct-array element address that is a
+             * genuine runtime value on the eval stack, unlike IR_STORE_FIELD
+             * which resolves its base from a fixed local/argument slot and
+             * therefore only ever pops the value. Here the base pointer has
+             * no such fallback - IR_ARRAY_ELEM_ADDR is the only place it was
+             * ever computed - so both the value and the base MUST come off
+             * the stack. Stack: [base_ptr, value] -> [] (value on top, same
+             * order OP_put_field's bytecode pushes them in). */
+            int16_t offset = instr->operand.field.offset;
+            NativeType field_type = instr->operand.field.field_type;
+
+            MipsReg value_reg = POP_REG();
+            NativeType value_type = POP_TYPE();
+            MipsReg base_reg = POP_REG();
+            NativeType base_type = POP_TYPE(); (void)base_type;
+
+            /* Same whole-number-float-literal fixup as IR_STORE_FIELD above -
+             * see the comment there. */
+            if (field_type == NATIVE_TYPE_FLOAT32 &&
+                (value_type == NATIVE_TYPE_INT32 || value_type == NATIVE_TYPE_UINT32 ||
+                 value_type == NATIVE_TYPE_BOOL)) {
+                MipsFpuReg fconv = mips_alloc_fpr(em);
+                mips_mtc1(em, value_reg, fconv);
+                mips_cvt_s_w(em, fconv, fconv);
+                mips_mfc1(em, value_reg, fconv);
+                mips_free_fpr(em, fconv);
+            }
+
+            switch (field_type) {
+                case NATIVE_TYPE_INT32:
+                case NATIVE_TYPE_UINT32:
+                case NATIVE_TYPE_BOOL:
+                case NATIVE_TYPE_PTR:
+                case NATIVE_TYPE_FLOAT32:
+                    mips_sw(em, value_reg, offset, base_reg);
+                    break;
+                case NATIVE_TYPE_INT64:
+                case NATIVE_TYPE_UINT64:
+                    mips_sd(em, value_reg, offset, base_reg);
+                    break;
+                default:
+                    mips_sw(em, value_reg, offset, base_reg);
+                    break;
+            }
+            break;
+        }
+
         /* Float arithmetic */
         case IR_ADD_F32:
         case IR_SUB_F32:
@@ -6927,6 +7254,21 @@ static int ir_op_stack_delta(const IRInstr *instr) {
         case IR_STORE_ARRAY:
             return -3;
 
+        /* Struct array field access - deltas below match the ACTUAL
+         * MIPS codegen for these three ops exactly (verified against the
+         * POP_REG/PUSH_REG call counts in each case), not copied from the
+         * (possibly stale, see IR_LOAD_FIELD/IR_STORE_FIELD above) doc
+         * comments on the IR op enum. This matters more here than for most
+         * ops: the primary use case for struct arrays is a loop body, which
+         * is exactly the multi-predecessor-block scenario this table exists
+         * to get right. */
+        case IR_ARRAY_ELEM_ADDR:  /* pop base, pop index -> push element addr */
+            return -1;
+        case IR_LOAD_FIELD_DYN:   /* pop base ptr -> push value */
+            return 0;
+        case IR_STORE_FIELD_DYN:  /* pop base ptr, pop value -> push nothing */
+            return -2;
+
         /* Pop 1, push 1 (unary ops, conversions, field load) */
         case IR_NEG_I32: case IR_NEG_I64: case IR_NEG_F32:
         case IR_SQRT_F32: case IR_ABS_F32: case IR_SIGN_F32:
@@ -7826,7 +8168,24 @@ JSValue native_func_call(JSContext *ctx, NativeFunc *func, int argc, JSValueCons
                 }
                 break;
             }
-            
+
+            case NATIVE_TYPE_STRUCT_ARRAY: {
+                /* StructType.array(N) result: a js_struct_instance_array_class_id
+                 * object whose opaque is the NativeStructInstance for the whole
+                 * contiguous block. Pass its base pointer, same as NATIVE_TYPE_PTR -
+                 * the compiled function does its own base+index*size addressing
+                 * (IR_ARRAY_ELEM_ADDR), it doesn't need the count from here (the
+                 * caller passes that as a separate int arg, same convention as
+                 * Float32Array+int). */
+                NativeStructInstance *inst =
+                    (NativeStructInstance *)JS_GetOpaque(argv[i], js_struct_instance_array_class_id);
+                if (!inst || !inst->data) {
+                    return JS_ThrowTypeError(ctx, "Expected a struct array (StructType.array(n)) at argument %d", i);
+                }
+                ptr_args[i] = inst->data;
+                break;
+            }
+
             case NATIVE_TYPE_STRING: {
                 /* Convert JS string to NativeString* */
                 const char *str = JS_ToCString(ctx, argv[i]);
@@ -7868,6 +8227,7 @@ JSValue native_func_call(JSContext *ctx, NativeFunc *func, int argc, JSValueCons
         if (NATIVE_TYPE_IS_ARRAY(sig->arg_types[i]) ||
             NATIVE_TYPE_IS_DYNAMIC_ARRAY(sig->arg_types[i]) ||
             sig->arg_types[i] == NATIVE_TYPE_PTR ||
+            sig->arg_types[i] == NATIVE_TYPE_STRUCT_ARRAY ||
             sig->arg_types[i] == NATIVE_TYPE_STRING) {
             args[i] = (int32_t)(intptr_t)ptr_args[i];
         } else if (sig->arg_types[i] == NATIVE_TYPE_FLOAT32) {

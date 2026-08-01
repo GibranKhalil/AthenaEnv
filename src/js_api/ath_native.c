@@ -87,8 +87,44 @@ static JSValue js_native_compile(JSContext *ctx, JSValue this_val,
     for (int i = 0; i < args_len; i++) {
         JSValue arg_type = JS_GetPropertyUint32(ctx, args_val, i);
         
-        /* Check if arg_type is a string (primitive type) or an object (struct constructor) */
-        if (JS_IsString(arg_type)) {
+        /* Check if arg_type is a string (primitive type), a one-element array
+         * (struct array: [StructType]), or an object (struct constructor).
+         * The array check MUST come before the generic object check below -
+         * arrays are objects in QuickJS too, and a bare struct constructor's
+         * _structDef check would otherwise run against the array itself and
+         * fail with a confusing error. */
+        if (JS_IsArray(ctx, arg_type)) {
+            JSValue len_val = JS_GetPropertyStr(ctx, arg_type, "length");
+            int32_t len = 0;
+            JS_ToInt32(ctx, &len, len_val);
+            JS_FreeValue(ctx, len_val);
+
+            if (len != 1) {
+                JS_FreeValue(ctx, arg_type);
+                JS_FreeValue(ctx, args_val);
+                return JS_ThrowTypeError(ctx,
+                    "Struct array argument at index %d must be [StructType] (exactly one element)", i);
+            }
+
+            JSValue elem = JS_GetPropertyUint32(ctx, arg_type, 0);
+            JSValue def_val = JS_GetPropertyStr(ctx, elem, "_structDef");
+            if (JS_IsUndefined(def_val)) {
+                JS_FreeValue(ctx, def_val);
+                JS_FreeValue(ctx, elem);
+                JS_FreeValue(ctx, arg_type);
+                JS_FreeValue(ctx, args_val);
+                return JS_ThrowTypeError(ctx,
+                    "Struct array argument at index %d must wrap a valid struct type", i);
+            }
+
+            sig.arg_types[i] = NATIVE_TYPE_STRUCT_ARRAY;
+            int64_t def_ptr;
+            if (JS_ToInt64(ctx, &def_ptr, def_val) == 0 && def_ptr != 0) {
+                arg_struct_defs[i] = (struct NativeStructDef *)(uintptr_t)def_ptr;
+            }
+            JS_FreeValue(ctx, def_val);
+            JS_FreeValue(ctx, elem);
+        } else if (JS_IsString(arg_type)) {
             /* Primitive type like 'int', 'float', 'ptr' or special 'self' */
             const char *type_str = JS_ToCString(ctx, arg_type);
             
@@ -695,6 +731,166 @@ static JSValue js_struct_set(JSContext *ctx, JSValueConst this_val, JSValueConst
     return JS_UNDEFINED;
 }
 
+/* ============================================
+ * NativeStructInstanceArray - StructType.array(N)
+ * A contiguous run of N struct instances (see native_struct_alloc_array),
+ * indexable from JS (arr[i] -> a live view over element i, sharing storage)
+ * and passable directly as a Native.compile [StructType] arg. Unrelated to
+ * NativeStructArrayView above, which is a view over an ARRAY FIELD *inside*
+ * one struct instance (e.g. mat.m[i]), not an array of struct instances.
+ * ============================================ */
+
+/* JS Class ID for the array wrapper itself (opaque = NativeStructInstance*,
+ * the one covering the whole block, with count == N). Individual elements
+ * (arr[i]) are plain js_struct_class_id objects wrapping a
+ * native_struct_view_at() instance - see js_struct_make_element_view. */
+JSClassID js_struct_instance_array_class_id = 0;
+
+static void js_struct_instance_array_finalizer(JSRuntime *rt, JSValue val) {
+    NativeStructInstance *inst = JS_GetOpaque(val, js_struct_instance_array_class_id);
+    if (inst) {
+        native_struct_free(inst);  /* frees the whole contiguous block */
+    }
+}
+
+/* Build a live view object for element `elem_data` of `def`-typed elements,
+ * reusing js_struct_get/js_struct_set unchanged (same class ID, same magic-
+ * indexed getter/setter installation as js_struct_constructor). `parent` is
+ * kept alive via a hidden property, since elem_data points INTO parent's
+ * buffer rather than owning its own copy. */
+static JSValue js_struct_make_element_view(JSContext *ctx, JSValueConst parent,
+                                            NativeStructDef *def, void *elem_data) {
+    NativeStructInstance *inst = native_struct_view_at(def, elem_data);
+    if (!inst) return JS_ThrowOutOfMemory(ctx);
+
+    JSValue obj = JS_NewObjectClass(ctx, js_struct_class_id);
+    if (JS_IsException(obj)) {
+        native_struct_free(inst);
+        return obj;
+    }
+    JS_SetOpaque(obj, inst);
+
+    for (int i = 0; i < def->field_count; i++) {
+        JSAtom atom = JS_NewAtom(ctx, def->fields[i].name);
+        JS_DefinePropertyGetSet(ctx, obj, atom,
+            JS_NewCFunctionMagic(ctx, (JSCFunctionMagic *)js_struct_get, def->fields[i].name, 0, JS_CFUNC_getter_magic, i),
+            JS_NewCFunctionMagic(ctx, (JSCFunctionMagic *)js_struct_set, def->fields[i].name, 1, JS_CFUNC_setter_magic, i),
+            0);
+        JS_FreeAtom(ctx, atom);
+    }
+
+    JS_DefinePropertyValueStr(ctx, obj, "__native_array_parent",
+                              JS_DupValue(ctx, parent), 0);
+    return obj;
+}
+
+/* Exotic get_own_property - handles numeric index access (arr[i]) and
+ * "length" on the array wrapper. No define_own_property/set trap: whole-
+ * element assignment (arr[i] = x) is out of scope, matching the native-
+ * compiler side (OP_put_array_el errors on this for struct arrays) -
+ * individual fields remain writable through the element view's own
+ * js_struct_set getters/setters. */
+static int js_struct_instance_array_get_own_property(JSContext *ctx,
+                                                       JSPropertyDescriptor *desc,
+                                                       JSValueConst obj, JSAtom prop) {
+    NativeStructInstance *arr_inst = JS_GetOpaque(obj, js_struct_instance_array_class_id);
+    if (!arr_inst || !arr_inst->def || !arr_inst->data) return 0;
+
+    const char *prop_str = JS_AtomToCString(ctx, prop);
+    if (!prop_str) return 0;
+
+    if (strcmp(prop_str, "length") == 0) {
+        JS_FreeCString(ctx, prop_str);
+        if (desc) {
+            desc->flags = JS_PROP_ENUMERABLE;
+            desc->value = JS_NewInt32(ctx, (int32_t)arr_inst->count);
+            desc->getter = JS_UNDEFINED;
+            desc->setter = JS_UNDEFINED;
+        }
+        return 1;
+    }
+
+    char *endptr;
+    long idx = strtol(prop_str, &endptr, 10);
+    JS_FreeCString(ctx, prop_str);
+
+    if (*endptr != '\0') return 0;  /* not a numeric index */
+    if (idx < 0 || (uint32_t)idx >= arr_inst->count) return 0;  /* out of bounds */
+
+    if (desc) {
+        /* Reuse a cached element view instead of allocating a fresh one on
+         * every access. Each view costs ~13 allocations (object + one getter
+         * + one setter closure per field + one atom per field) - fine for an
+         * occasional read, but arr[i].field from plain JS (as opposed to
+         * inside Native.compile, where it's just pointer arithmetic - see
+         * IR_ARRAY_ELEM_ADDR) at real per-frame game-loop volume turned into
+         * a real allocator/GC bottleneck.
+         *
+         * Cached under a plain (non-exotic) property on the array wrapper,
+         * so it's resolved by normal property lookup (find_own_property in
+         * quickjs.c) before this exotic get_own_property is ever consulted -
+         * no risk of re-entering this function for "__view_cache" itself. */
+        JSValue cache = JS_GetPropertyStr(ctx, obj, "__view_cache");
+        if (JS_IsUndefined(cache)) {
+            cache = JS_NewArray(ctx);
+            JS_DefinePropertyValueStr(ctx, obj, "__view_cache", JS_DupValue(ctx, cache), 0);
+        }
+        JSValue view = JS_GetPropertyUint32(ctx, cache, (uint32_t)idx);
+        if (JS_IsUndefined(view)) {
+            void *elem_data = (uint8_t *)arr_inst->data + (size_t)idx * arr_inst->def->size;
+            view = js_struct_make_element_view(ctx, obj, arr_inst->def, elem_data);
+            JS_SetPropertyUint32(ctx, cache, (uint32_t)idx, JS_DupValue(ctx, view));
+        }
+        JS_FreeValue(ctx, cache);
+
+        desc->flags = JS_PROP_ENUMERABLE;
+        desc->getter = JS_UNDEFINED;
+        desc->setter = JS_UNDEFINED;
+        desc->value = view;
+    }
+    return 1;
+}
+
+static const JSClassExoticMethods js_struct_instance_array_exotic = {
+    .get_own_property = js_struct_instance_array_get_own_property,
+};
+
+static JSClassDef js_struct_instance_array_class = {
+    "NativeStructInstanceArray",
+    .finalizer = js_struct_instance_array_finalizer,
+    .exotic = &js_struct_instance_array_exotic,
+};
+
+/* StructType.array(count) - allocates `count` contiguous instances.
+ * func_data[0] = def_holder (same holder js_struct_constructor uses). */
+static JSValue js_struct_array_factory(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv,
+                                        int magic, JSValue *func_data) {
+    NativeStructDef *def = JS_GetOpaque(func_data[0], js_struct_def_class_id);
+    if (!def) return JS_ThrowTypeError(ctx, "Invalid struct type");
+
+    int32_t count = 0;
+    if (argc < 1 || JS_ToInt32(ctx, &count, argv[0]) < 0 || count < 1) {
+        return JS_ThrowTypeError(ctx, "StructType.array(count) requires count >= 1");
+    }
+
+    if (js_struct_instance_array_class_id == 0) {
+        JS_NewClassID(&js_struct_instance_array_class_id);
+        JS_NewClass(JS_GetRuntime(ctx), js_struct_instance_array_class_id, &js_struct_instance_array_class);
+    }
+
+    NativeStructInstance *inst = native_struct_alloc_array(def, (uint32_t)count, 1);
+    if (!inst) return JS_ThrowOutOfMemory(ctx);
+
+    JSValue obj = JS_NewObjectClass(ctx, js_struct_instance_array_class_id);
+    if (JS_IsException(obj)) {
+        native_struct_free(inst);
+        return obj;
+    }
+    JS_SetOpaque(obj, inst);
+    return obj;
+}
+
 /* Native method wrapper - calls native function with struct ptr as arg0
  * func_data[0] = original native function
  * func_data[1] = struct instance (obj)
@@ -1021,9 +1217,17 @@ static JSValue js_native_struct(JSContext *ctx, JSValue this_val,
     
     /* Add _structDef property to allow extraction of NativeStructDef pointer */
     /* This is used by Native.compile to map struct types to their definitions */
-    JS_DefinePropertyValueStr(ctx, constructor, "_structDef", 
+    JS_DefinePropertyValueStr(ctx, constructor, "_structDef",
                               JS_NewInt64(ctx, (int64_t)(uintptr_t)def), 0);
-    
+
+    /* StructType.array(N) - allocate N contiguous instances (see
+     * js_struct_array_factory). Reuses def_holder the same way the
+     * constructor itself does; JS_NewCFunctionData dups its own ref. */
+    JSValue array_func_data[1] = { def_holder };
+    JSValue array_fn = JS_NewCFunctionData(ctx, (JSCFunctionData *)js_struct_array_factory,
+                                            1, 0, 1, array_func_data);
+    JS_DefinePropertyValueStr(ctx, constructor, "array", array_fn, JS_PROP_ENUMERABLE);
+
     /* Free our reference to def_holder - JS_NewCFunctionData has its own ref */
     JS_FreeValue(ctx, def_holder);
     
