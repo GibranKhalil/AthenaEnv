@@ -1213,13 +1213,21 @@ P.S.: outline and drop shadow do not coexist, so one of them must be 0.0f.
   • mouse.x  
   • mouse.y  
   • mouse.wheel  
-  • mouse.buttons  
-* Mouse.setBoundary(minx, maxx, miny, maxy) - Set mouse x and y bounds.
-* let mode = Mouse.getMode() - Get mouse mode(absolute or relative).
+  • mouse.buttons — bitmask, compare against Mouse.BTN1/BTN2/BTN3 and Mouse.BTN1_DBL/BTN2_DBL/BTN3_DBL  
+* Mouse.setBoundary(minx, maxx, miny, maxy) - Set mouse x and y bounds (only relevant in Mouse.READMODE_ABS).
+* let bounds = Mouse.getBoundary() - Returns the current bounds as `{ minX, maxX, minY, maxY }`.
+* let mode = Mouse.getMode() - Get mouse mode, one of Mouse.READMODE_DIFF (relative movement) or Mouse.READMODE_ABS (absolute position).
 * Mouse.setMode(mode) - Set mouse mode.
 * let accel = Mouse.getAccel() - Get mouse acceleration.
 * Mouse.setAccel(val) - Set mouse acceleration.
 * Mouse.setPosition(x, y) - Set mouse pointer position.
+* let thres = Mouse.getThreshold() - Get the movement threshold (in mickeys) before a move is reported.
+* Mouse.setThreshold(thres) - Set the movement threshold.
+* let msec = Mouse.getDoubleClickTime() - Get the max interval between clicks counted as a double-click, in milliseconds.
+* Mouse.setDoubleClickTime(msec) - Set the double-click interval.
+* let version = Mouse.getVersion() - Get the ps2mouse.irx driver version.
+* let mask = Mouse.enumerate() - Returns a driver-defined bitmask describing the connected mice (see ps2sdk's `PS2MouseEnum`; not validated against real hardware here).
+* Mouse.reset() - Resets the mouse driver state (already called once internally by Mouse.init()).
   
 ### System module
 * let ret = System.nativeCall(address, arguments, *return_type*)  
