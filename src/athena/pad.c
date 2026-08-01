@@ -253,6 +253,26 @@ int athena_pad_type(int port)
     return padInfoMode(port, 0, PAD_MODETABLE, 0);
 }
 
+int athena_pad_active_type(int port)
+{
+    athena_pad_check_reconnect(port);
+    return padInfoMode(port, 0, PAD_MODECURID, 0);
+}
+
+int athena_pad_set_mode(int port, int mode, bool lock)
+{
+    athena_pad_check_reconnect(port);
+
+    int state = padGetState(port, 0);
+    if (state != PAD_STATE_STABLE && state != PAD_STATE_FINDCTP1)
+        return -1;
+
+    int ret = padSetMainMode(port, 0, mode, lock ? PAD_MMODE_LOCK : PAD_MMODE_UNLOCK);
+    waitPadReady(port, 0);
+
+    return ret;
+}
+
 bool athena_pad_is_active(int port)
 {
     return athena_pad_port_connected(port);

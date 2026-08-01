@@ -30,6 +30,8 @@ void athena_pad_rumble(int port, char act_align0, char act_align1);
 void athena_pad_set_led(int port, uint8_t r, uint8_t g, uint8_t b);
 int athena_pad_state(int port);
 int athena_pad_type(int port);
+int athena_pad_active_type(int port);
+int athena_pad_set_mode(int port, int mode, bool lock);
 bool athena_pad_is_active(int port);
 int athena_pad_connected_count(void);
 void athena_pad_check_reconnect(int port);

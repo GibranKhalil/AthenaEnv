@@ -21,6 +21,40 @@ static JSValue js_pad_gettype(JSContext *ctx, JSValue this_val, int argc, JSValu
     return JS_NewInt32(ctx, athena_pad_type(port));
 }
 
+static JSValue js_pad_getactivetype(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv)
+{
+    if (argc != 0 && argc != 1)
+        return JS_ThrowSyntaxError(ctx, "wrong number of arguments");
+    int32_t port = 0;
+    if (argc == 1) {
+        JS_ToInt32(ctx, &port, argv[0]);
+        if (port < 0 || port > 1)
+            return JS_ThrowSyntaxError(ctx, "wrong port number.");
+    }
+    return JS_NewInt32(ctx, athena_pad_active_type(port));
+}
+
+static JSValue js_pad_setmode(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv)
+{
+    if (argc != 2 && argc != 3)
+        return JS_ThrowSyntaxError(ctx, "wrong number of arguments.");
+    int32_t port = 0, mode = 0;
+    int lock;
+    if (argc == 3) {
+        JS_ToInt32(ctx, &port, argv[0]);
+        JS_ToInt32(ctx, &mode, argv[1]);
+        lock = JS_ToBool(ctx, argv[2]);
+    } else {
+        JS_ToInt32(ctx, &mode, argv[0]);
+        lock = JS_ToBool(ctx, argv[1]);
+    }
+
+    if (port < 0 || port > 1)
+        return JS_ThrowSyntaxError(ctx, "wrong port number.");
+
+    return JS_NewInt32(ctx, athena_pad_set_mode(port, mode, lock));
+}
+
 static JSValue js_pad_new_event(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv)
 {
     int buttons, flavour;
@@ -297,6 +331,8 @@ static JSValue js_pad_set_prop(JSContext *ctx, JSValueConst this_val, JSValue va
 static const JSCFunctionListEntry module_funcs[] = {
     JS_CFUNC_DEF("get", 1, js_pad_getpad),
     JS_CFUNC_DEF("getType", 1, js_pad_gettype),
+    JS_CFUNC_DEF("getActiveType", 1, js_pad_getactivetype),
+    JS_CFUNC_DEF("setMode", 3, js_pad_setmode),
     JS_CFUNC_DEF("getState", 1, js_pad_getstate),
     JS_CFUNC_DEF("getPressure", 2, js_pad_getpressure),
     JS_CFUNC_DEF("rumble", 3, js_pad_rumble),
@@ -340,6 +376,8 @@ static const JSCFunctionListEntry module_funcs[] = {
     JS_PROP_INT32_DEF("STATE_EXECCMD", PAD_STATE_EXECCMD, JS_PROP_CONFIGURABLE),
     JS_PROP_INT32_DEF("STATE_STABLE", PAD_STATE_STABLE, JS_PROP_CONFIGURABLE),
     JS_PROP_INT32_DEF("STATE_ERROR", PAD_STATE_ERROR, JS_PROP_CONFIGURABLE),
+    JS_PROP_INT32_DEF("MMODE_DIGITAL", PAD_MMODE_DIGITAL, JS_PROP_CONFIGURABLE),
+    JS_PROP_INT32_DEF("MMODE_DUALSHOCK", PAD_MMODE_DUALSHOCK, JS_PROP_CONFIGURABLE),
 };
 
 static const JSCFunctionListEntry js_pad_proto_funcs[] = {

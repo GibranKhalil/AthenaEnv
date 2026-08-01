@@ -1184,11 +1184,14 @@ P.S.: outline and drop shadow do not coexist, so one of them must be 0.0f.
   • Pads.JUST_PRESSED  
   • Pads.NON_PRESSED  
 * Pads.deleteEvent(event_id) - Deletes the event created by Pads.newEvent.
-* let type = Pads.getType(*port*) - Gets gamepad type in the specified port.
+* let type = Pads.getType(*port*) - Gets the gamepad type reported at mode-table slot 0 (usually its baseline digital identity, not necessarily what's active right now).
+* let type = Pads.getActiveType(*port*) - Gets the gamepad type currently active (reflects Pads.setMode() changes and the pad's own Analog/Select-button toggling).
 * Pad Types:  
-  • Pads.DIGITAL  
-  • Pads.ANALOG  
-  • Pads.DUALSHOCK  
+  • Pads.TYPE_DIGITAL  
+  • Pads.TYPE_ANALOG  
+  • Pads.TYPE_DUALSHOCK  
+
+* Pads.setMode(*port*, mode, lock) - Forces the gamepad's digital/analog mode and whether the player can change it themselves (e.g. via the Analog button). `mode` is Pads.MMODE_DIGITAL or Pads.MMODE_DUALSHOCK; `lock` is a boolean (true = user can't toggle mode, false = unlocked). Switching to MMODE_DUALSHOCK on a pad that doesn't support it is simply rejected by the pad -- check Pads.getActiveType() afterwards if you need to confirm it took effect. Note this only sets the basic digital/analog mode -- it doesn't by itself negotiate pressure-sensitive buttons or rumble, which the engine already does automatically at connect time for capable pads.
 
 * let press = Pads.getPressure(*port*, button) - Get button pressure level.
 * Pads.rumble(port, big, small) - Rumble your gamepad.
