@@ -1,8 +1,6 @@
 // {"name": "Keyboard demo", "author": "Daniel Santos", "version": "04102023", "file": "keyboard.js"}
 
-import * as Keyboard from "athena_keyboard.erl"
-
-IOP.loadModule(System.boot_path + "/iop/ps2kbd.irx");
+IOP.loadModule("ps2kbd");
 
 Keyboard.init();
 

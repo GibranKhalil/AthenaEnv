@@ -6,15 +6,18 @@ static JSValue js_sifregistermodule(JSContext *ctx, JSValue this_val, int argc, 
 {
 	void *data = NULL;
 	size_t size = 0;
+	size_t name_len = 0;
 	uint8_t dependencies[4] = { EMPTY_ENTRY, EMPTY_ENTRY, EMPTY_ENTRY, EMPTY_ENTRY };
 	JSValue init_fun = NULL, end_fun = NULL;
 	iopman_func init = NULL, end = NULL;
-	char *name = JS_ToCStringLen(ctx, &size, argv[0]);
+	char *name = JS_ToCStringLen(ctx, &name_len, argv[0]);
 
-	if (JS_IsString(argv[1]))
+	if (JS_IsString(argv[1])) {
 		data = (void *)JS_ToCString(ctx, argv[1]);
-	else
+		size = 0; /* size == 0 tells iopman_load_module this is a file path, not a buffer */
+	} else {
 		data = JS_GetArrayBuffer(ctx, &size, argv[1]);
+	}
 
 	if (argc > 2) {
 		JSValue arg_array = JS_GetPropertyStr(ctx, argv[2], "deps");
@@ -50,6 +53,9 @@ static JSValue js_sifregistermodule(JSContext *ctx, JSValue this_val, int argc, 
 	}
 
 	module_entry *result = athena_iop_register_module(name, data, size, dependencies, init, end);
+	if (!result)
+		return JS_ThrowInternalError(ctx, "newModule: IOP module registry is full.");
+
 	if (init_fun)
 		result->init_args = (void *)init_fun;
 	if (end_fun)
@@ -77,12 +83,17 @@ static JSValue js_sifloadmodule(JSContext *ctx, JSValue this_val, int argc, JSVa
 
 	int arg_len = 0;
 	const char *args = NULL;
-	if (argc == 3) {
-		JS_ToInt32(ctx, &arg_len, argv[1]);
-		args = JS_ToCString(ctx, argv[2]);
+	if (argc > 1 && !JS_IsUndefined(argv[1])) {
+		size_t len = 0;
+		args = JS_ToCStringLen(ctx, &len, argv[1]);
+		arg_len = (int)len;
 	}
 
 	int ret = athena_iop_load_module(module, arg_len, args);
+
+	if (args)
+		JS_FreeCString(ctx, args);
+
 	if (ret == MODULE_STATUS_INCOMPATIBILITY) {
 		return JS_ThrowInternalError(ctx, "loadModule: %s module is incompatible with %s, which is actually loaded. Keep or reset IOP.",
 			module->name, iopman_get_incompatible_module()->name);
@@ -151,7 +162,7 @@ static JSValue js_getiopmemory(JSContext *ctx, JSValue this_val, int argc, JSVal
 
 static const JSCFunctionListEntry sif_funcs[] = {
 	JS_CFUNC_DEF("newModule", 3, js_sifregistermodule),
-	JS_CFUNC_DEF("loadModule", 3, js_sifloadmodule),
+	JS_CFUNC_DEF("loadModule", 2, js_sifloadmodule),
 	JS_CFUNC_DEF("getModule", 1, js_sifgetmodule),
 	JS_CFUNC_DEF("getModules", 0, js_sifgetmodules),
 	JS_CFUNC_DEF("reset", 0, js_resetiop),

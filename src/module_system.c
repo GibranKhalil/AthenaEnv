@@ -159,12 +159,12 @@ void register_iop_modules() {
 	#endif
 	
 	#ifdef ATHENA_PADEMU
-	module_entry *ds34bt_entry = 
+	module_entry *ds34bt_entry =
 		iopman_register_module_buffer("ds34bt", ds34bt, iop_dependency(usbd_entry), ds34bt_init, ds34bt_deinit);
-	iopman_set_module_args(ds34bt_entry, sizeof(ds34pads), ds34pads);
-	module_entry *ds34usb_entry = 
+	iopman_set_module_args(ds34bt_entry, sizeof(ds34pads), (char *)&ds34pads);
+	module_entry *ds34usb_entry =
 		iopman_register_module_buffer("ds34usb", ds34usb, iop_dependency(usbd_entry), ds34usb_init, ds34usb_deinit);
-	iopman_set_module_args(ds34bt_entry, sizeof(ds34pads), ds34pads);
+	iopman_set_module_args(ds34usb_entry, sizeof(ds34pads), (char *)&ds34pads);
 	#endif
 	
 	module_entry *poweroff_entry = 
