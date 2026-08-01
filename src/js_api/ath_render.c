@@ -1573,11 +1573,11 @@ static JSValue js_render_batch_size(JSContext *ctx, JSValueConst this_val, int m
 static JSValue athena_render_batch_free(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     JSRenderBatch *rb = JS_GetOpaque2(ctx, this_val, js_render_batch_class_id);
 
-    if (!rb || !rb->batch)
+    if (!rb || !rb->native)
         return JS_UNDEFINED;
 
-    athena_batch_destroy(rb->batch);
-    rb->batch = NULL;
+    athena_render_batch_destroy(rb->native);
+    rb->native = NULL;
 
     return JS_UNDEFINED;
 }
