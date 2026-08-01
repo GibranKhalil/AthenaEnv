@@ -129,6 +129,9 @@ static JSValue js_pad_getpressure(JSContext *ctx, JSValue this_val, int argc, JS
         JS_ToUint32(ctx, &button, argv[0]);
     }
 
+    if (port < 0 || port > 1)
+        return JS_ThrowSyntaxError(ctx, "wrong port number.");
+
     return JS_NewInt32(ctx, athena_pad_pressure(port, button));
 }
 
@@ -136,8 +139,8 @@ static JSValue js_pad_rumble(JSContext *ctx, JSValue this_val, int argc, JSValue
 {
     if (argc != 2 && argc != 3)
         return JS_ThrowSyntaxError(ctx, "wrong number of arguments.");
-    int port = 0;
-    char act_align0, act_align1;
+    int32_t port = 0;
+    int32_t act_align0 = 0, act_align1 = 0;
     if (argc == 3) {
         JS_ToInt32(ctx, &port, argv[0]);
         JS_ToInt32(ctx, &act_align0, argv[1]);
@@ -147,7 +150,10 @@ static JSValue js_pad_rumble(JSContext *ctx, JSValue this_val, int argc, JSValue
         JS_ToInt32(ctx, &act_align1, argv[1]);
     }
 
-    athena_pad_rumble(port, act_align0, act_align1);
+    if (port < 0 || port > 1)
+        return JS_ThrowSyntaxError(ctx, "wrong port number.");
+
+    athena_pad_rumble(port, (char)act_align0, (char)act_align1);
     return JS_UNDEFINED;
 }
 
@@ -180,20 +186,23 @@ static JSValue js_pad_set_led(JSContext *ctx, JSValue this_val, int argc, JSValu
 {
     if (argc != 3 && argc != 4)
         return JS_ThrowSyntaxError(ctx, "wrong number of arguments.");
-    u8 led[3];
-    int port = 0;
+    int32_t port = 0;
+    int32_t led0 = 0, led1 = 0, led2 = 0;
     if (argc == 4) {
         JS_ToInt32(ctx, &port, argv[0]);
-        JS_ToInt32(ctx, &led[0], argv[1]);
-        JS_ToInt32(ctx, &led[1], argv[2]);
-        JS_ToInt32(ctx, &led[2], argv[3]);
+        JS_ToInt32(ctx, &led0, argv[1]);
+        JS_ToInt32(ctx, &led1, argv[2]);
+        JS_ToInt32(ctx, &led2, argv[3]);
     } else {
-        JS_ToInt32(ctx, &led[0], argv[0]);
-        JS_ToInt32(ctx, &led[1], argv[1]);
-        JS_ToInt32(ctx, &led[2], argv[2]);
+        JS_ToInt32(ctx, &led0, argv[0]);
+        JS_ToInt32(ctx, &led1, argv[1]);
+        JS_ToInt32(ctx, &led2, argv[2]);
     }
 
-    athena_pad_set_led(port, led[0], led[1], led[2]);
+    if (port < 0 || port > 1)
+        return JS_ThrowSyntaxError(ctx, "wrong port number.");
+
+    athena_pad_set_led(port, (u8)led0, (u8)led1, (u8)led2);
     return JS_UNDEFINED;
 }
 
