@@ -43,6 +43,9 @@ static const athena_js_module_entry_t athena_js_modules[] = {
 #ifdef ATHENA_MOUSE
     { athena_mouse_init },
 #endif
+#ifdef ATHENA_REMOTE
+    { athena_remote_init },
+#endif
 #ifdef ATHENA_CAMERA
     { athena_camera_init },
 #endif
@@ -84,6 +87,10 @@ const char *athena_js_globals_prelude(void) {
 #ifdef ATHENA_MOUSE
         "import * as Mouse from 'Mouse';\n"
         "globalThis.Mouse = Mouse;\n"
+#endif
+#ifdef ATHENA_REMOTE
+        "import * as Remote from 'Remote';\n"
+        "globalThis.Remote = Remote;\n"
 #endif
 #ifdef ATHENA_NETWORK
         "import * as Network from 'Network';\n"

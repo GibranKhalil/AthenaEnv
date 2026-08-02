@@ -68,8 +68,13 @@ void register_iop_modules() {
 		iopman_register_module_buffer("padman", padman, iop_dependency(sio2man_entry), pad_init, padEnd);
 	iopman_start_module_at_boot(padman_entry);
 
-	module_entry *mtapman_entry = 
+	module_entry *mtapman_entry =
 		iopman_register_module_buffer("mtapman", mtapman, iop_dependency(sio2man_entry), mtapInit, NULL);
+
+	#ifdef ATHENA_REMOTE
+	module_entry *rmman_entry =
+		iopman_register_module_buffer("rmman", rmman, iop_dependency(sio2man_entry), NULL, NULL);
+	#endif
 
 	module_entry *mmceman_entry = 
 		iopman_register_module_buffer("mmceman", mmceman, iop_dependency(fileXio_entry), NULL, NULL);

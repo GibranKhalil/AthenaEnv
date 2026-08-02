@@ -20,6 +20,9 @@ $(EE_EMBED_DIR)padman.c: $(PS2SDK)/iop/irx/padman.irx | $(EE_EMBED_DIR)
 $(EE_EMBED_DIR)mtapman.c: $(PS2SDK)/iop/irx/mtapman.irx | $(EE_EMBED_DIR)
 	$(BIN2S) $< $@ mtapman_irx
 
+$(EE_EMBED_DIR)rmman.c: $(PS2SDK)/iop/irx/rmman.irx | $(EE_EMBED_DIR)
+	$(BIN2S) $< $@ rmman_irx
+
 $(EE_EMBED_DIR)libsd.c: $(PS2SDK)/iop/irx/libsd.irx | $(EE_EMBED_DIR)
 	$(BIN2S) $< $@ libsd_irx
 

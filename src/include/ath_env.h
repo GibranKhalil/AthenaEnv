@@ -65,6 +65,10 @@ JSModuleDef *athena_keyboard_init(JSContext *ctx);
 JSModuleDef *athena_mouse_init(JSContext *ctx);
 #endif
 
+#ifdef ATHENA_REMOTE
+JSModuleDef *athena_remote_init(JSContext *ctx);
+#endif
+
 #ifdef ATHENA_AUDIO
 JSModuleDef *athena_sound_init(JSContext *ctx);
 #endif

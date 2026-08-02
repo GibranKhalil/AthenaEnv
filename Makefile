@@ -53,6 +53,7 @@ STATIC_KEYBOARD ?= 1
 STATIC_MOUSE ?= 1
 STATIC_NETWORK ?= 1
 STATIC_CAMERA ?= 0
+STATIC_REMOTE ?= 1
 
 DYNAMIC_KEYBOARD ?= 0
 DYNAMIC_MOUSE ?= 0
@@ -211,6 +212,14 @@ ifeq ($(STATIC_MOUSE),1)
   EE_LIBS += -lmouse
 
   DYNAMIC_MOUSE = 0
+endif
+
+ifeq ($(STATIC_REMOTE),1)
+  EE_CFLAGS += -DATHENA_REMOTE
+  APP_CORE += remote.o athena/remote.o
+  ATHENA_MODULES += ath_remote.o
+  IOP_MODULES += rmman.o
+  EE_LIBS += -lrm
 endif
 
 ifeq ($(STATIC_CAMERA),1)
