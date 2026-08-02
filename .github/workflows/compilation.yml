@@ -11,25 +11,51 @@ on:
   repository_dispatch:
     types: [run_build]
 
+env:
+  PS2DEV_VERSION: v2.0.0
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: ghcr.io/ps2homebrew/ps2homebrew:main
     steps:
     - name: git checkout
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-    - name: Workaround permission issue
+    - name: Install PS2DEV toolchain
       run: |
-        git config --global --add safe.directory /__w/AthenaEnv/AthenaEnv
-        git fetch --prune --unshallow
+        PS2DEV=/usr/local/ps2dev
+        PS2SDK="$PS2DEV/ps2sdk"
+        GSKIT="$PS2DEV/gsKit"
+
+        sudo mkdir -p "$PS2DEV"
+        sudo chown "$USER" "$PS2DEV"
+
+        curl -fsSL -o ps2dev.tar.gz \
+          "https://github.com/ps2dev/ps2dev/releases/download/${PS2DEV_VERSION}/ps2dev-ubuntu-latest.tar.gz"
+        tar -xf ps2dev.tar.gz --strip-components 1 -C "$PS2DEV"
+        rm ps2dev.tar.gz
+
+        sed -i'' "s|/__w/ps2dev/ps2dev/ps2dev/ps2sdk/ports|${PS2SDK}/ports|g" "$PS2SDK"/ports/lib/pkgconfig/*.pc
+        sed -i'' "s|/__w/ps2dev/ps2dev/ps2dev/ps2sdk/ports|${PS2SDK}/ports|g" "$GSKIT"/lib/pkgconfig/*.pc
+        sed -i'' "s|/__w/ps2dev/ps2dev/ps2dev/gsKit|${GSKIT}/|g" "$GSKIT"/lib/pkgconfig/*.pc
+
+        echo "PS2DEV=$PS2DEV" >> "$GITHUB_ENV"
+        echo "PS2SDK=$PS2SDK" >> "$GITHUB_ENV"
+        echo "GSKIT=$GSKIT" >> "$GITHUB_ENV"
+        echo "$PS2DEV/bin" >> "$GITHUB_PATH"
+        echo "$PS2DEV/ee/bin" >> "$GITHUB_PATH"
+        echo "$PS2DEV/iop/bin" >> "$GITHUB_PATH"
+        echo "$PS2DEV/dvp/bin" >> "$GITHUB_PATH"
+        echo "$PS2SDK/bin" >> "$GITHUB_PATH"
 
     - name: Compile project
       run: |
         chmod +x build-exports.sh
         make clean all
       env:
-        ATHENAENV_SRC: "/__w/AthenaEnv/AthenaEnv/src"
+        ATHENAENV_SRC: "${{ github.workspace }}/src"
 
     - name: Get short SHA
       id: slug
