@@ -468,10 +468,14 @@ void sound_set_position(SoundStream *snd, int ms) {
     stream_lock();
 
     if (snd->type == OGG_AUDIO) {
-        uint32_t f_pos = (uint32_t)(((long long)ms * snd->fmt.freq / 1000)) * (snd->fmt.bits / 16);
-        ov_pcm_seek(snd->fp, (f_pos / AUDIO_STREAM_BUFFER_SIZE) * AUDIO_STREAM_BUFFER_SIZE);
+        /* ov_pcm_seek() takes a position in sample-frames, not bytes --
+         * rounding to AUDIO_STREAM_BUFFER_SIZE (a byte count with no
+         * relation to the sample rate) doesn't belong here. */
+        uint32_t frame_pos = (uint32_t)((long long)ms * snd->fmt.freq / 1000);
+        ov_pcm_seek(snd->fp, frame_pos);
     } else if (snd->type == WAV_AUDIO) {
-        uint32_t f_pos = (uint32_t)(((long long)ms * snd->fmt.freq / 1000)) * (snd->fmt.bits / 4);
+        uint32_t bytes_per_frame = snd->fmt.channels * (snd->fmt.bits / 8);
+        uint32_t f_pos = (uint32_t)((long long)ms * snd->fmt.freq / 1000) * bytes_per_frame;
         fseek(snd->fp, snd->data_offset + f_pos, SEEK_SET);
     }
 
