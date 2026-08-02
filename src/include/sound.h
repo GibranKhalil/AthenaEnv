@@ -32,6 +32,8 @@ typedef struct {
     struct audsrv_fmt_t fmt;
     int type;
     bool loop;
+    long data_offset;  /* WAV only: file offset where PCM sample data begins */
+    int duration_ms;   /* cached at load time so length queries never touch fp */
 } SoundStream;
 
 SoundStream *sound_load(const char* path);
