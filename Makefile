@@ -161,7 +161,17 @@ ifeq ($(MPEG_VIDEO),1)
   EE_CFLAGS += -DATHENA_MPEG_VIDEO
   APP_CORE += mpeg_player.o athena/video.o
   ATHENA_MODULES += ath_mpeg.o
-  EE_LIBS += -lmpeg
+  # Prefer the vendored libmpeg sources (src/libmpeg, from our ps2sdk fork's
+  # fix-libmpeg branch -- fixes real ABI/$at register bugs in libmpeg_core.s
+  # that the toolchain's prebuilt libmpeg.a doesn't have) over the toolchain
+  # build; fall back to it if the vendored sources aren't present.
+  ifneq (,$(wildcard $(EE_SRC_DIR)libmpeg/include/libmpeg.h))
+    EE_INCS += -I$(EE_SRC_DIR)libmpeg/include
+    EE_LIBS += -Lee_modules/mpeg/lib -lmpeg
+    EXT_LIBS += ee_modules/mpeg/lib/libmpeg.a
+  else
+    EE_LIBS += -lmpeg
+  endif
 endif
 
 ifneq ($(EE_SIO), 0)
@@ -336,6 +346,7 @@ clean:
 	$(MAKE) -C ee_modules/loader clean
 	$(MAKE) -C ee_modules/ode clean
 	$(MAKE) -C ee_modules/bearssl clean
+	$(MAKE) -C ee_modules/mpeg clean
 
 	$(MAKE) -f Makefile.dl KEYBOARD=$(DYNAMIC_KEYBOARD) clean
 	$(MAKE) -f Makefile.dl MOUSE=$(DYNAMIC_MOUSE) clean
@@ -349,6 +360,10 @@ include Makefile.embed
 # Build vendored BearSSL static library when present and TLS enabled
 ee_modules/bearssl/lib/libbearssl.a:
 	$(MAKE) -C ee_modules/bearssl
+
+# Build vendored libmpeg static library when present
+ee_modules/mpeg/lib/libmpeg.a:
+	$(MAKE) -C ee_modules/mpeg
 
 $(EE_EMBED_DIR):
 	@mkdir -p $@
