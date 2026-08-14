@@ -143,7 +143,8 @@ static JSValue js_image_draw(JSContext *ctx, JSValue this_val, int argc, JSValue
             return JS_EXCEPTION;
         }
     }
-    athena_image_draw(image, x, y);
+
+    athena_image_draw(image, x, y, width, height, startx, starty, endx, endy, angle, color);
     return JS_UNDEFINED;
 }
 
