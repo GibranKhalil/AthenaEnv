@@ -358,7 +358,7 @@ clean:
 	$(MAKE) -C ee_modules/loader clean
 	$(MAKE) -C ee_modules/ode clean
 	$(MAKE) -C ee_modules/bearssl clean
-  $(MAKE) -C ee_modules/box2d clean
+	$(MAKE) -C ee_modules/box2d clean
 	$(MAKE) -C ee_modules/mpeg clean
 
 	$(MAKE) -f Makefile.dl KEYBOARD=$(DYNAMIC_KEYBOARD) clean
