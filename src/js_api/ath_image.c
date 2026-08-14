@@ -100,7 +100,7 @@ static inline int get_optional_uint32(JSContext *ctx, JSValue obj, const char *p
     return 0;
 }
 
-static JSValue athena_image_draw(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv)
+static JSValue js_image_draw(JSContext *ctx, JSValue this_val, int argc, JSValueConst *argv)
 {
     AthenaImage *image = JS_GetOpaque2(ctx, this_val, js_image_class_id);
     
@@ -113,7 +113,7 @@ static JSValue athena_image_draw(JSContext *ctx, JSValue this_val, int argc, JSV
     }
     
     if (argc < 2) {
-        return JS_ThrowTypeError(ctx, "drawEx requires at least (x, y)");
+        return JS_ThrowTypeError(ctx, "draw requires at least (x, y)");
     }
     
     float x, y;
