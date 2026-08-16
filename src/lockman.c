@@ -68,12 +68,10 @@ void init_lockman() {
     }
 }
 
-
 int create_mutex() {
-    u32 state;
     int id = -1;
 
-    CpuSuspendIntr(&state);
+    DIntr();
     for(int i = 0; i < MAX_MUTEXES; i++){
         if (mutexes[i].id == -1){
             mutexes[i].id = i;   // reserva o slot imediatamente
@@ -81,7 +79,7 @@ int create_mutex() {
             break;
         }
     }
-    CpuResumeIntr(state);
+    EIntr();
 
     if (id == -1)
         return -1;
@@ -100,14 +98,13 @@ void delete_mutex(int id) {
     if (id < 0 || id >= MAX_MUTEXES)
         return;
 
-    u32 state;
-    CpuSuspendIntr(&state);
+    DIntr();
     int internal_id = -1;
     if (mutexes[id].id == id) {
         internal_id = mutexes[id].internal_id;
         mutexes[id].id = -1;
     }
-    CpuResumeIntr(state);
+    EIntr();
 
     if (internal_id >= 0)
         DeleteSema(internal_id);
@@ -126,10 +123,9 @@ void unlock_mutex(int id) {
 }
 
 int create_semaphore(int initial_count, int max_count) {
-    u32 state;
     int id = -1;
 
-    CpuSuspendIntr(&state);
+    DIntr();
     for (int i = 0; i < MAX_SEMAPHORES; i++) {
         if (semaphores[i].id == -1) {
             semaphores[i].id = i;   // reserva o slot imediatamente
@@ -137,7 +133,7 @@ int create_semaphore(int initial_count, int max_count) {
             break;
         }
     }
-    CpuResumeIntr(state);
+    EIntr();
 
     if (id == -1)
         return -1;
@@ -159,14 +155,13 @@ void delete_semaphore(int id) {
     if (id < 0 || id >= MAX_SEMAPHORES)
         return;
 
-    u32 state;
-    CpuSuspendIntr(&state);
+    DIntr();
     int internal_id = -1;
     if (semaphores[id].id == id) {
         internal_id = semaphores[id].internal_id;
         semaphores[id].id = -1;
     }
-    CpuResumeIntr(state);
+    EIntr();
 
     if (internal_id >= 0)
         DeleteSema(internal_id);

@@ -35,8 +35,7 @@ bool is_invalid_task(Task* task) {
 }
 
 void new_task(int id, size_t stack_sz, void* stack, const char* title){
-    u32 state;
-    CpuSuspendIntr(&state);
+    DIntr();
     for(int i = 0; i < MAX_THREADS; i++){
         if (is_invalid_task(&tasks[i])){
             tasks[i].id = id;
@@ -47,7 +46,7 @@ void new_task(int id, size_t stack_sz, void* stack, const char* title){
             break;
         }
     }
-    CpuResumeIntr(state);
+    EIntr();
 }
 
 s32 AthenaCreateThread(ee_thread_t *thread) {
@@ -56,10 +55,9 @@ s32 AthenaCreateThread(ee_thread_t *thread) {
 }
 
 void free_task(int id){
-    u32 state;
     void *stack_to_free = NULL;
 
-    CpuSuspendIntr(&state);
+    DIntr();
     for(int i = 0; i < MAX_THREADS; i++){
         if (tasks[i].id == id){
             tasks[i].id = -1;
@@ -73,7 +71,7 @@ void free_task(int id){
             break;
         }
     }
-    CpuResumeIntr(state);
+    EIntr();
 
     if (stack_to_free)
         free(stack_to_free);
@@ -162,11 +160,10 @@ void exit_task(){
 
 // for internal use
 void exit_kill_task() {
-    u32 state;
     void *stack_to_free = NULL;
     int self_id = GetThreadId();
 
-    CpuSuspendIntr(&state);
+    DIntr();
     for(int i = 0; i < MAX_THREADS; i++){
         if (tasks[i].id == self_id) {
             tasks[i].id = -1;
@@ -180,7 +177,7 @@ void exit_kill_task() {
             break;
         }
     }
-    CpuResumeIntr(state);
+    EIntr();
 
     if (stack_to_free)
         free(stack_to_free);
