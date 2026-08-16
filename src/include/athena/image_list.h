@@ -9,6 +9,8 @@ typedef struct AthenaImageList {
     int sema_id;
     int thread_id;
     int mutex_id;
+    volatile bool should_stop;
+    int done_sema_id;
 } AthenaImageList;
 
 AthenaImageList *athena_image_list_create(void);
