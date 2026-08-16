@@ -30,10 +30,14 @@ static Task tasks[MAX_THREADS];
 static int tasks_size = 0;
 
 bool is_invalid_task(Task* task) {
-    return (task->id == -1 && !task->title && task->id == -1 && task->stack_size == 0 && task->stack == NULL);
+    return (task->id == -1 && !task->title &&
+            task->stack_size == 0 && task->stack == NULL);
 }
 
 void new_task(int id, size_t stack_sz, void* stack, const char* title){
+    bool inserted = false;
+
+    DIntr();
     for(int i = 0; i < MAX_THREADS; i++){
         if (is_invalid_task(&tasks[i])){
             tasks[i].id = id;
@@ -41,32 +45,54 @@ void new_task(int id, size_t stack_sz, void* stack, const char* title){
             tasks[i].status = 0;
             tasks[i].title = title;
             tasks[i].stack = stack;
+            inserted = true;
             break;
         }
     }
+    EIntr();
+
+    if (!inserted)
+        dbgprintf("taskman: tabela cheia (MAX_THREADS=%d), task %d nao registrada\n", MAX_THREADS, id);
 }
 
 s32 AthenaCreateThread(ee_thread_t *thread) {
-    new_task(tasks_size++, thread->stack_size, thread->stack, thread->option == 0? "Unknown" : thread->option);
-    return CreateThread(thread);
+    s32 id = CreateThread(thread);
+    if (id >= 0) {
+        const char *title = (thread->option == 0)
+            ? "Unknown"
+            : (const char *)thread->option;
+        new_task(id, thread->stack_size, thread->stack, title);
+
+        DIntr();
+        if (id >= tasks_size)
+            tasks_size = id + 1;
+        EIntr();
+    }
+    return id;
 }
 
 void free_task(int id){
+    void *stack_to_free = NULL;
+
+    DIntr();
     for(int i = 0; i < MAX_THREADS; i++){
         if (tasks[i].id == id){
             tasks[i].id = -1;
             tasks[i].stack_size = 0;
             tasks[i].status = -1;
             tasks[i].title = NULL;
-            free(tasks[i].stack);
+            stack_to_free = tasks[i].stack;
             tasks[i].stack = NULL;
 
             tasks_size--;
-
-            DeleteThread(id);
             break;
         }
     }
+    EIntr();
+
+    if (stack_to_free)
+        free(stack_to_free);
+    DeleteThread(id);
 }
 
 
@@ -76,18 +102,18 @@ void init_taskman()
     info.stack_size = -1;
     tasks_size = 1;
 
-    for (uint32_t i = &__start; i < &_end; i += sizeof(uint32_t)) {
-        if(*(uint32_t*)i == (0x0C000000 + ((uint32_t)CreateThread)/4)) {
-            RedirectCall(i, AthenaCreateThread);
-        }
-    }
-
     for(int i = 0; i < MAX_THREADS; i++){
         tasks[i].id = -1;
         tasks[i].stack_size = 0;
         tasks[i].status = -1;
         tasks[i].title = NULL;
         tasks[i].stack = NULL;
+    }
+
+    for (uint32_t i = &__start; i < &_end; i += sizeof(uint32_t)) {
+        if(*(uint32_t*)i == (0x0C000000 + ((uint32_t)CreateThread)/4)) {
+            RedirectCall(i, AthenaCreateThread);
+        }
     }
 
     ReferThreadStatus(tasks_size, &info);
@@ -98,7 +124,7 @@ void init_taskman()
     tasks_size++;
 
     do {
-        
+
         ReferThreadStatus(tasks_size, &info);
         if(info.stack_size != 0) {
             new_task(tasks_size, info.stack_size, info.stack, "Unknown");
@@ -106,7 +132,7 @@ void init_taskman()
         }
 
     } while(info.stack_size != 0); //A way to list already created threads
-    
+
     dbgprintf("Threads running during boot: %d\n", tasks_size);
 
     dbgprintf("Task manager started successfully!\n");
@@ -114,15 +140,15 @@ void init_taskman()
 }
 
 int create_task(const char* title, void* func, int stack_size, int priority)
-{    
+{
     ee_thread_t thread_param;
-	
+
 	thread_param.gp_reg = &_gp;
     thread_param.func = func;
     thread_param.stack_size = stack_size;
     thread_param.stack = memalign(128, stack_size);
     thread_param.initial_priority = priority;
-    thread_param.option = title;
+    thread_param.option = (u32)title;
 
 	int thread = CreateThread(&thread_param);
 
@@ -132,7 +158,7 @@ int create_task(const char* title, void* func, int stack_size, int priority)
     }
 
     dbgprintf("%s task created.\n", title);
-    
+
     return thread;
 
 }
@@ -151,23 +177,31 @@ void exit_task(){
 
 // for internal use
 void exit_kill_task() {
+    void *stack_to_free = NULL;
+    int self_id = GetThreadId();
+
+    DIntr();
     for(int i = 0; i < MAX_THREADS; i++){
-        if (tasks[i].id == GetThreadId()) {
+        if (tasks[i].id == self_id) {
             tasks[i].id = -1;
             tasks[i].stack_size = 0;
             tasks[i].status = -1;
             tasks[i].title = NULL;
-            free(tasks[i].stack);
+            stack_to_free = tasks[i].stack;
             tasks[i].stack = NULL;
 
             tasks_size--;
-
-            ExitDeleteThread();
             break;
         }
     }
+    EIntr();
+
+    if (stack_to_free)
+        free(stack_to_free);
+
+    ExitDeleteThread();
 }
 
 Task* get_tasks() {
-    return &tasks;
+    return tasks;
 }
