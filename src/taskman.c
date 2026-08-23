@@ -43,6 +43,7 @@ void new_task(int id, size_t stack_sz, void* stack, const char* title){
             tasks[i].status = 0;
             tasks[i].title = title;
             tasks[i].stack = stack;
+            inserted = true;
             break;
         }
     }
@@ -50,8 +51,19 @@ void new_task(int id, size_t stack_sz, void* stack, const char* title){
 }
 
 s32 AthenaCreateThread(ee_thread_t *thread) {
-    new_task(tasks_size++, thread->stack_size, thread->stack, thread->option == 0? "Unknown" : thread->option);
-    return CreateThread(thread);
+    s32 id = CreateThread(thread);
+    if (id >= 0) {
+        const char *title = (thread->option == 0)
+            ? "Unknown"
+            : (const char *)thread->option;
+        new_task(id, thread->stack_size, thread->stack, title);
+
+        DIntr();
+        if (id >= tasks_size)
+            tasks_size = id + 1;
+        EIntr();
+    }
+    return id;
 }
 
 void free_task(int id){
@@ -85,18 +97,18 @@ void init_taskman()
     info.stack_size = -1;
     tasks_size = 1;
 
-    for (uint32_t i = &__start; i < &_end; i += sizeof(uint32_t)) {
-        if(*(uint32_t*)i == (0x0C000000 + ((uint32_t)CreateThread)/4)) {
-            RedirectCall(i, AthenaCreateThread);
-        }
-    }
-
     for(int i = 0; i < MAX_THREADS; i++){
         tasks[i].id = -1;
         tasks[i].stack_size = 0;
         tasks[i].status = -1;
         tasks[i].title = NULL;
         tasks[i].stack = NULL;
+    }
+
+    for (uint32_t i = &__start; i < &_end; i += sizeof(uint32_t)) {
+        if(*(uint32_t*)i == (0x0C000000 + ((uint32_t)CreateThread)/4)) {
+            RedirectCall(i, AthenaCreateThread);
+        }
     }
 
     ReferThreadStatus(tasks_size, &info);
@@ -131,7 +143,7 @@ int create_task(const char* title, void* func, int stack_size, int priority)
     thread_param.stack_size = stack_size;
     thread_param.stack = memalign(128, stack_size);
     thread_param.initial_priority = priority;
-    thread_param.option = title;
+    thread_param.option = (u32)title;
 
 	int thread = CreateThread(&thread_param);
 

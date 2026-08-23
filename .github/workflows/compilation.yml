@@ -11,6 +11,9 @@ on:
   repository_dispatch:
     types: [run_build]
 
+permissions:
+  contents: write
+
 env:
   PS2DEV_VERSION: v2.0.0
 
