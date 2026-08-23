@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <owl_packet.h>
 #include <athena/sprite.h>
 
 void athena_sprite_init(void) {
@@ -74,8 +75,15 @@ uint32_t athena_sprite_descriptor_material_count(const AthenaTilemapDescriptor *
     return descriptor ? descriptor->descriptor.material_count : 0;
 }
 
+void athena_sprite_instance_wait_pending(AthenaTilemapInstance *instance) {
+    if (instance && instance->sprites)
+        owl_wait_generation(instance->last_draw_generation);
+}
+
 static int athena_sprite_instance_apply_buffer(AthenaTilemapInstance *instance,
     athena_sprite_data *sprites, uint32_t sprite_count, bool copy_sprites) {
+
+    athena_sprite_instance_wait_pending(instance);
 
     if (instance->owned_sprite_buffer) {
         free(instance->owned_sprite_buffer);
@@ -121,6 +129,7 @@ AthenaTilemapInstance *athena_sprite_instance_create(
 void athena_sprite_instance_destroy(AthenaTilemapInstance *instance) {
     if (!instance)
         return;
+    athena_sprite_instance_wait_pending(instance);
     if (instance->owned_sprite_buffer)
         free(instance->owned_sprite_buffer);
     free(instance);
@@ -129,7 +138,8 @@ void athena_sprite_instance_destroy(AthenaTilemapInstance *instance) {
 void athena_sprite_instance_render(AthenaTilemapInstance *instance, float x, float y, float z) {
     if (!instance || !instance->descriptor || !instance->sprites)
         return;
-    tile_render_render(&instance->descriptor->descriptor, instance->sprites, x, y, z);
+    instance->last_draw_generation =
+        tile_render_render(&instance->descriptor->descriptor, instance->sprites, x, y, z);
 }
 
 int athena_sprite_instance_replace_buffer(AthenaTilemapInstance *instance,
@@ -154,6 +164,8 @@ int athena_sprite_instance_update_sprites(AthenaTilemapInstance *instance,
         return -1;
     if ((uint64_t)dst_offset + copy_count > instance->sprite_count)
         return -1;
+
+    athena_sprite_instance_wait_pending(instance);
     memcpy(&instance->sprites[dst_offset], src, copy_count * sizeof(athena_sprite_data));
     return 0;
 }

@@ -467,6 +467,14 @@ static JSValue js_tilemap_instance_update(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+static JSValue js_tilemap_instance_wait_pending(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+	JSTilemapInstance *instance = JS_GetOpaque2(ctx, this_val, js_tilemap_instance_class_id);
+	if (!instance || !instance->instance)
+		return JS_EXCEPTION;
+	athena_sprite_instance_wait_pending(instance->instance);
+	return JS_UNDEFINED;
+}
+
 static void js_sprite_buffer_free(JSRuntime *rt, void *opaque, void *ptr) {
 	if (ptr)
 		js_free_rt(rt, ptr);
@@ -573,6 +581,7 @@ static const JSCFunctionListEntry js_tilemap_instance_proto_funcs[] = {
 	JS_CFUNC_DEF("replaceSpriteBuffer", 1, js_tilemap_instance_replace_buffer),
 	JS_CFUNC_DEF("getSpriteBuffer", 0, js_tilemap_instance_get_buffer),
 	JS_CFUNC_DEF("updateSprites", 3, js_tilemap_instance_update),
+	JS_CFUNC_DEF("waitPending", 0, js_tilemap_instance_wait_pending),
 };
 
 static const JSCFunctionListEntry js_tilemap_spritebuffer_funcs[] = {

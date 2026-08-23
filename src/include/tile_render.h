@@ -64,7 +64,7 @@ void tile_render_init();
 void tile_render_begin();
 void tile_render_set_camera(float x, float y);
 
-void tile_render_render(
+uint32_t tile_render_render(
 	athena_tilemap_descriptor *descriptor,
 	athena_sprite_data *sprites,
 	float x,

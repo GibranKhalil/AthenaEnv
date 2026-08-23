@@ -18,6 +18,7 @@ typedef struct AthenaTilemapInstance {
     athena_sprite_data *sprites;
     uint32_t sprite_count;
     void *owned_sprite_buffer;
+    uint32_t last_draw_generation;
 } AthenaTilemapInstance;
 
 void athena_sprite_init(void);
@@ -43,6 +44,8 @@ athena_sprite_data *athena_sprite_instance_get_sprites(AthenaTilemapInstance *in
     uint32_t *sprite_count);
 int athena_sprite_instance_update_sprites(AthenaTilemapInstance *instance,
     uint32_t dst_offset, const athena_sprite_data *src, uint32_t copy_count);
+
+void athena_sprite_instance_wait_pending(AthenaTilemapInstance *instance);
 
 athena_sprite_data *athena_sprite_buffer_create(uint32_t sprite_count);
 athena_sprite_data *athena_sprite_buffer_from_data(const athena_sprite_data *sprites,

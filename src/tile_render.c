@@ -88,14 +88,14 @@ const athena_tilemap_layout *tile_render_layout() {
 	return &k_tile_layout;
 }
 
-void tile_render_render(
+uint32_t tile_render_render(
 	athena_tilemap_descriptor *descriptor,
 	athena_sprite_data *sprites,
 	float x,
 	float y,
 	float zindex) {
     if (!descriptor || !sprites || descriptor->material_count == 0)
-        return;
+        return owl_flush_generation();
 
     int batch_size = BATCH_SIZE_2D;
     int mpg_addr = vu_mpg_preload(vu1_tile_list, true);
@@ -119,6 +119,9 @@ void tile_render_render(
 	int last_index = -1;
 	GSSURFACE* tex = NULL;
 	int texture_id = -1;
+
+	bool first_batch = true;
+
 	for(int i = 0; i < descriptor->material_count; i++) {
 		athena_sprite_material *material = &descriptor->materials[i];
 		set_screen_param(ALPHA_BLEND_EQUATION, material->blend_mode);
@@ -195,7 +198,8 @@ void tile_render_render(
 			owl_add_uint(packet, VIF_CODE(0, 0, VIF_FLUSHA, 0));  
 			owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 0));
 			owl_add_uint(packet, VIF_CODE(count, 0, VIF_ITOP, 0));
-			owl_add_uint(packet, VIF_CODE(mpg_addr, 0, (last_index == -1? VIF_MSCALF : VIF_MSCNT), 0)); 
+			owl_add_uint(packet, VIF_CODE(mpg_addr, 0, (first_batch? VIF_MSCALF : VIF_MSCNT), 0));
+			first_batch = false;
 
 			idxs_to_draw -= count;
 			idxs_drawn += count;
@@ -210,4 +214,5 @@ void tile_render_render(
 
     set_screen_param(ALPHA_BLEND_EQUATION, old_alpha);
 
+    return owl_flush_generation();
 }
