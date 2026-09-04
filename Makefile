@@ -59,7 +59,7 @@ EE_BIN_PKD := $(EE_BIN_DIR)$(EE_BIN_PKD)$(EE_EXT)
 
 all: $(DIR_GUARD) $(EE_OBJS)
 	$(EE_CXX) -T$(EE_LINKFILE) $(EE_OPTFLAGS) -o $(EE_BIN_DIR)tmp.elf $(EE_OBJS) $(EE_LDFLAGS) $(EXTRA_LDFLAGS) -Wno-write-strings $(EE_LIBS) $(EE_SRC_DIR)dummy-exports.c
-	./build-exports.sh
+	sh ./build-exports.sh
 	$(EE_CXX) -T$(EE_LINKFILE) $(EE_OPTFLAGS) -o $(EE_BIN) $(EE_OBJS) $(EE_LDFLAGS) $(EXTRA_LDFLAGS) -fpermissive -Wno-write-strings $(EE_LIBS) $(EE_SRC_DIR)exports.c
 	rm -f $(EE_BIN_DIR)tmp.elf
 	@echo "$$HEADER"
@@ -69,7 +69,7 @@ all: $(DIR_GUARD) $(EE_OBJS)
 
 debug: $(DIR_GUARD) $(EE_OBJS)
 	$(EE_CXX) -T$(EE_LINKFILE) $(EE_OPTFLAGS) -o $(EE_BIN_DIR)tmp.elf $(EE_OBJS) $(EE_LDFLAGS) $(EXTRA_LDFLAGS) -Wno-write-strings $(EE_LIBS) $(EE_SRC_DIR)dummy-exports.c
-	./build-exports.sh
+	sh ./build-exports.sh
 	$(EE_CXX) -T$(EE_LINKFILE) $(EE_OPTFLAGS) -o bin/athena_debug.elf $(EE_OBJS) $(EE_LDFLAGS) $(EXTRA_LDFLAGS) -fpermissive -Wno-write-strings $(EE_LIBS) $(EE_SRC_DIR)exports.c
 	rm -f $(EE_BIN_DIR)tmp.elf
 	echo "Building bin/athena_debug.elf with debug symbols..."
