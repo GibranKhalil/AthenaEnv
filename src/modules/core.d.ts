@@ -1,5 +1,5 @@
 /**
- * AthenaEnv v2 Type Definitions for VS Code IntelliSense (Pure JavaScript)
+ * AthenaEnv Type Definitions for VS Code IntelliSense (Pure JavaScript)
  * Generated based on selected modules.
  */
 
