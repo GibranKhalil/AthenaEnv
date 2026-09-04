@@ -3,66 +3,85 @@ name: CI
 on:
   push:
     branches:
-      - '*'
+      - main
+      - my-version
     tags:
-      - v*
+      - 'v*'
   pull_request:
+    branches:
+      - main
+      - my-version
   workflow_dispatch:
-  repository_dispatch:
-    types: [run_build]
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: ghcr.io/ps2homebrew/ps2homebrew:main
+    # Pinned to immutable digest matching Dockerfile
+    container: ghcr.io/ps2homebrew/ps2homebrew@sha256:207523ad98f17fd406afa7dd0c6cfe10730627545cbe45247f0bd73c8a66c376
+
     steps:
-    - name: git checkout
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Workaround permission issue
-      run: |
-        git config --global --add safe.directory /__w/AthenaEnv/AthenaEnv
-        git fetch --prune --unshallow
+      - name: Configure safe directory
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --prune --unshallow || true
 
-    - name: Compile project
-      run: |
-        chmod +x build-exports.sh
-        make clean all
-      env:
-        ATHENAENV_SRC: "/__w/AthenaEnv/AthenaEnv/src"
+      - name: Compile AthenaEnv Core (Release & Debug)
+        run: |
+          chmod +x build-exports.sh
+          make clean all
+          make debug
+        env:
+          ATHENAENV_SRC: "${{ github.workspace }}/src"
 
-    - name: Get short SHA
-      id: slug
-      run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_ENV
+      - name: Prepare distribution bundle
+        run: |
+          mkdir -p dist/AthenaEnv
+          # Copy executables
+          cp bin/*.elf dist/AthenaEnv/
+          # Copy developer assets & starter files
+          cp athena.d.ts dist/AthenaEnv/ 2>/dev/null || true
+          cp jsconfig.json dist/AthenaEnv/ 2>/dev/null || true
+          cp main.js dist/AthenaEnv/ 2>/dev/null || true
+          # Create archive
+          cd dist
+          tar -zcvf ../AthenaEnv.tar.gz AthenaEnv
+          cd ..
 
-    - name: Upload artifacts
-      if: ${{ success() }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: AthenaEnv-${{ steps.slug.outputs.sha8 }}
-        path: bin
+      - name: Get short SHA
+        id: slug
+        run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-8)" >> "$GITHUB_OUTPUT"
 
-    - name: Compress & Rename bin folder
-      run: |
-        mv bin/ AthenaEnv/
-        tar -zcvf AthenaEnv.tar.gz AthenaEnv
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AthenaEnv-${{ steps.slug.outputs.sha8 }}
+          path: dist/AthenaEnv/
+          retention-days: 14
 
+      - name: Automatic Pre-release (main branch)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "AthenaEnv Development Build"
+          body: "Automated development build from commit ${{ github.sha }}."
+          prerelease: true
+          files: AthenaEnv.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Create Pre-release
-      if: github.ref == 'refs/heads/main'
-      uses: mathieucarbou/marvinpinto-action-automatic-releases@latest
-      with:
-        repo_token: "${{ secrets.GITHUB_TOKEN }}"
-        automatic_release_tag: "latest"
-        title: "Development build"
-        files: |
-               AthenaEnv.tar.gz
-
-    - name: Release
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v2
-      with:
-        files: AthenaEnv.tar.gz
-        tag_name: ${{ steps.tag.outputs.VERSION }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tagged Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Release ${{ github.ref_name }}"
+          generate_release_notes: true
+          files: AthenaEnv.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
