@@ -111,6 +111,15 @@ function commandCatalog() {
     const outPath = path.join(ROOT_DIR, 'catalog.json');
     fs.writeFileSync(outPath, JSON.stringify(catalog, null, 2), 'utf8');
     console.log(`[Athena] Catalog generated successfully at ${outPath} (${modules.length} modules registered).`);
+
+    const publicDir = path.join(ROOT_DIR, 'public');
+    if (fs.existsSync(publicDir)) {
+        fs.writeFileSync(path.join(publicDir, 'catalog.json'), JSON.stringify(catalog, null, 2), 'utf8');
+        const dtsSrc = path.join(BIN_DIR, 'athena.d.ts');
+        if (fs.existsSync(dtsSrc)) {
+            fs.copyFileSync(dtsSrc, path.join(publicDir, 'athena.d.ts'));
+        }
+    }
     return catalog;
 }
 

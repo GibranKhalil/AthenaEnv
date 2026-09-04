@@ -1,4 +1,4 @@
-name: CI
+name: CI & GitHub Pages
 
 on:
   push:
@@ -15,9 +15,57 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "ci-pages-${{ github.ref }}"
+  cancel-in-progress: false
 
 jobs:
+  catalog:
+    name: Catalog & GitHub Pages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Regenerate catalog & public assets
+        run: |
+          node tools/modules.js catalog
+
+      - name: Commit & push updated catalog (if changed)
+        if: github.event_name == 'push'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update catalog.json and public assets [skip ci]"
+          file_pattern: "catalog.json public/*"
+
+      - name: Setup Pages
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/my-version')
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/my-version')
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'public'
+
+      - name: Deploy to GitHub Pages
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/my-version')
+        id: deployment
+        uses: actions/deploy-pages@v4
+
   build:
+    name: Build PS2 Homebrew
+    needs: catalog
     runs-on: ubuntu-latest
     # Pinned to immutable digest matching Dockerfile
     container: ghcr.io/ps2homebrew/ps2homebrew@sha256:207523ad98f17fd406afa7dd0c6cfe10730627545cbe45247f0bd73c8a66c376
