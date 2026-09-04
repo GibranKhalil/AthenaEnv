@@ -43,7 +43,6 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 
-#include <graphics.h>
 #include <ath_env.h>
 
 #include "cutils.h"
