@@ -38,7 +38,7 @@ endif
 JS_CORE = quickjs/cutils.o quickjs/libbf.o quickjs/libregexp.o quickjs/libunicode.o \
           quickjs/realpath.o quickjs/quickjs.o quickjs/quickjs-libc.o
 
-APP_CORE = main.o memory.o ee_tools.o module_system.o iop_manager.o strUtils.o system.o excepHandler.o exceptions.o sioprintf.o
+APP_CORE = main.o memory.o ee_tools.o module_system.o iop_manager.o strUtils.o system.o excepHandler.o exceptions.o sioprintf.o athena_math.o
 
 INI_READER = readini/src/readini.o
 

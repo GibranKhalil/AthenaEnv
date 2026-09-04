@@ -398,16 +398,10 @@ static JSValue js_loadScript(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
-void js_destroy_render_loop(JSContext *ctx);
-void js_destroy_input_events(JSContext *ctx);
-
 static JSValue js_reload(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
-    uint8_t *buf;
     const char *filename;
-    JSValue ret;
-    size_t buf_len;
     
     filename = JS_ToCString(ctx, argv[0]);
     if (!filename)
@@ -421,11 +415,6 @@ static JSValue js_reload(JSContext *ctx, JSValueConst this_val,
     
     set_default_script(filename);
     JS_FreeCString(ctx, filename);
-
-    js_destroy_render_loop(ctx);
-    js_destroy_input_events(ctx);
-
-    js_set_clear_color(GS_SETREG_RGBAQ(0x00, 0x00, 0x00, 0x80, 0x00));
 
     destroy_vm(ctx);
 
@@ -1043,7 +1032,7 @@ static JSValue js_std_file_close(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
     JSSTDFile *s = JS_GetOpaque2(ctx, this_val, js_std_file_class_id);
-    int err;
+    int err = 0;
     if (!s)
         return JS_EXCEPTION;
     if (!s->f)
@@ -3603,87 +3592,9 @@ void js_std_promise_rejection_tracker(JSContext *ctx, JSValueConst promise,
     }
 }
 
-/* main loop which calls the user JS callbacks */
-
-static JSValueConst render_loop_func = JS_UNDEFINED;
-static JSValueConst global_obj_ref = JS_UNDEFINED;
-static uint64_t clear_color = GS_SETREG_RGBAQ(0x00, 0x00, 0x00, 0x80, 0x00);
-
-void js_set_render_loop_func(JSContext *ctx, JSValueConst func) {
-    if (func == JS_UNDEFINED || func == JS_NULL) {
-        js_destroy_render_loop(ctx);
-        return;
-    }
-
-    render_loop_func = func;
-}
-
-void js_set_clear_color(uint64_t color) {
-    clear_color = color;
-}
-
-typedef struct {
-    int buttons;
-    JSValueConst function;
-    EventFlavours flavour;
-} InputEvent;
-
-static InputEvent padEvents[64] = { 0 };
-static uint8_t totalPadEvents = 0;
-
-static JSPads* inputEventHandler = NULL;
-
-void js_set_input_event_handler(JSPads* pad) {
-    inputEventHandler = pad;
-}
-
-int js_new_input_event(int buttons, JSValueConst func, EventFlavours flavour) {
-    for (int i = 0; i < 64; i++) {
-        if (!padEvents[i].function) {
-            padEvents[i].buttons = buttons;
-            padEvents[i].function = func;
-            padEvents[i].flavour = flavour;
-            totalPadEvents++;
-            return i;
-        }
-    }
-    return -1;
-}
-
-void js_delete_input_event(int id) {
-    padEvents[id].buttons = 0;
-    padEvents[id].function = NULL;
-    padEvents[id].flavour = PRESSED_EVENT;
-    totalPadEvents--;
-}
-
-void js_destroy_render_loop(JSContext *ctx) {
-    if (render_loop_func != JS_UNDEFINED) {
-        JS_FreeValue(ctx, render_loop_func);
-    }
-
-    render_loop_func = JS_UNDEFINED;
-}
-
-void js_destroy_input_events(JSContext *ctx) {
-    if (totalPadEvents) {
-        for (int i = 0; i < 64; i++) {
-            if (padEvents[i].function) {
-                JS_FreeValue(ctx, padEvents[i].function);
-                padEvents[i].function = NULL;
-                padEvents[i].buttons = 0;
-                padEvents[i].flavour = 0;
-            }
-        }
-    }
-
-    totalPadEvents = 0;
-}
-
 int js_std_loop(JSContext *ctx)
 {
     JSContext *ctx1;
-    JSValue ret;
     int err;
     int poll_result;
 
@@ -3699,70 +3610,21 @@ int js_std_loop(JSContext *ctx)
             }
         }
 
-        if (render_loop_func != JS_UNDEFINED) {
-            clearScreen(clear_color);
-            ret = JS_Call(ctx, render_loop_func, JS_UNDEFINED, 0, NULL);
-            flipScreen();
-
-            if (JS_IsException(ret)) {
-                err = -1;
-            }
-        }
-
-        if (inputEventHandler && err != -1) {
-            js_pads_update(inputEventHandler);
-            if (totalPadEvents) {
-                for (int i = 0; i < 64; i++) {
-                    if (padEvents[i].function) {
-                        bool trigger_event = false;
-                        switch (padEvents[i].flavour) {
-                            case PRESSED_EVENT:
-                                trigger_event = (inputEventHandler->btns & padEvents[i].buttons);
-                                break;
-                            case JUSTPRESSED_EVENT:
-                                trigger_event = ((inputEventHandler->btns & padEvents[i].buttons) && !(inputEventHandler->old_btns & padEvents[i].buttons));
-                                break;
-                            case NONPRESSED_EVENT:
-                                trigger_event = !(inputEventHandler->btns & padEvents[i].buttons);
-                                break;
-                        };
-
-                        if (trigger_event) {
-                            ret = JS_Call(ctx, padEvents[i].function, JS_UNDEFINED, 0, NULL);            
-
-                            if (JS_IsException(ret)) {
-                                err = -1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if ((poll_result = js_os_poll(ctx)) == JS_POLL_EXCEPTION || err == -1) {
-            if (render_loop_func != JS_UNDEFINED)
-                JS_FreeValue(ctx, render_loop_func);
-
-            if (totalPadEvents) {
-                for (int i = 0; i < 64; i++) {
-                    if (padEvents[i].function) {
-                        JS_FreeValue(ctx, padEvents[i].function);
-                    }
-                }
-            }
-            
-            if (poll_result == JS_POLL_EXCEPTION)
-                return poll_result;
-
+        if (err < 0) {
             return err;
         }
-            
 
-        if (poll_result == JS_POLL_EMPTY && render_loop_func == JS_UNDEFINED && !totalPadEvents)
+        poll_result = js_os_poll(ctx);
+        if (poll_result == JS_POLL_EXCEPTION) {
+            return -1;
+        }
+
+        if (poll_result == JS_POLL_EMPTY) {
             break;
+        }
     }
 
-    return err;
+    return 0;
 }
 
 void js_std_eval_binary(JSContext *ctx, const uint8_t *buf, size_t buf_len,

@@ -1,6 +1,10 @@
 #ifndef ATHENA_MATH_H
 #define ATHENA_MATH_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 float athena_cosf(float x);
 float athena_atan2f(float y, float x);
 float athena_randomf(float min, float max);
@@ -9,5 +13,9 @@ float athena_asinf(float x);
 float athena_acosf(float x);
 float athena_sinf(float x);
 float athena_tanf(float x);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
