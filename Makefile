@@ -4,7 +4,7 @@ include Makefile.const
 define HEADER
 
 ==================================================
-           AthenaEnv v2 - Minimal Core
+           AthenaEnv - Minimal Core
 ==================================================
 
 endef

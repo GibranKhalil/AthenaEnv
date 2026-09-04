@@ -132,7 +132,7 @@ int main(int argc, char **argv) {
     dbginit();
 
     dbgprintf("\n========================================\n");
-    dbgprintf("       AthenaEnv Core v2 (Minimal)      \n");
+    dbgprintf("       AthenaEnv Core (Minimal)      \n");
     dbgprintf("========================================\n");
     dbgprintf("[AthenaCore] Boot path: %s\n", boot_path);
 

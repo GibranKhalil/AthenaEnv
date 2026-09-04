@@ -185,7 +185,7 @@ void athena_display_crash_screen(const char *title, const char *err_msg)
 
     scr_printf("\n");
     scr_printf("  ========================================================================\n");
-    scr_printf("                       AthenaEnv v2 - CRASH REPORT                        \n");
+    scr_printf("                       AthenaEnv - CRASH REPORT                        \n");
     scr_printf("  ========================================================================\n\n");
 
     if (title) {

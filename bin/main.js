@@ -8,6 +8,8 @@ while (frameCount < 10) {
 
     frameCount++;
 
+    funcao();
+
     console.log(
         `[Frame ${frameCount}] dt: ${dt.toFixed(2)}ms`
     );
