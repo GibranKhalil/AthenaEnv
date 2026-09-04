@@ -10,6 +10,7 @@
 #include <strUtils.h>
 #include <ath_env.h>
 #include <def_mods.h>
+#include <excepHandler.h>
 
 #define NEWLIB_PORT_AWARE
 #include <fileXio_rpc.h>
@@ -244,6 +245,9 @@ int main(int argc, char **argv) {
         dbgprintf("%s\n", err_msg);
         dbgprintf("=============================================================\n");
         printf("\n[AthenaCore Error]: %s\n", err_msg);
+
+        // Render On-Screen Crash Screen on TV
+        athena_display_crash_screen("JavaScript Uncaught Exception", err_msg);
 
         // Infinite loop to keep console output visible
         while (1) {

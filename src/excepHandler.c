@@ -172,3 +172,33 @@ void installExceptionHandlers(void)
         SetVCommonHandler(i, pkoExceptionHandler);
     }
 }
+
+void athena_display_crash_screen(const char *title, const char *err_msg)
+{
+    FlushCache(0);
+    FlushCache(2);
+
+    init_scr();
+    scr_setbgcolor(0x00400020);
+    scr_setcursorcolor(0x00400020);
+    scr_clear();
+
+    scr_printf("\n");
+    scr_printf("  ========================================================================\n");
+    scr_printf("                       AthenaEnv v2 - CRASH REPORT                        \n");
+    scr_printf("  ========================================================================\n\n");
+
+    if (title) {
+        scr_printf("  [Fault]: %s\n\n", title);
+    }
+
+    if (err_msg) {
+        scr_printf("  %s\n\n", err_msg);
+    }
+
+    scr_printf("  ------------------------------------------------------------------------\n");
+    scr_printf("  [System Halted] Check the report above and reset the console.\n");
+    scr_printf("  ========================================================================\n");
+
+    SleepThread();
+}

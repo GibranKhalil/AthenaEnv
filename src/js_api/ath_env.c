@@ -95,7 +95,13 @@ static int qjs_handle_fh(JSContext *ctx, FILE *f, const char *filename) {
             "import * as System from 'System';\n"
             "globalThis.std = std;\n"
             "globalThis.os = os;\n"
-            "globalThis.System = System;\n";
+            "globalThis.System = System;\n"
+            "globalThis.setTimeout = os.setTimeout;\n"
+            "globalThis.setInterval = os.setInterval;\n"
+            "globalThis.setImmediate = os.setImmediate;\n"
+            "globalThis.clearTimeout = os.clearTimeout;\n"
+            "globalThis.clearInterval = os.clearInterval;\n"
+            "globalThis.clearImmediate = os.clearImmediate;\n";
 
         rc = qjs_eval_buf(ctx, str, strlen(str), "<bootstrap>", JS_EVAL_TYPE_MODULE);
         if (rc != 0) { 

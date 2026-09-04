@@ -8,7 +8,16 @@
 #ifndef _EXCEPTION_H_
 #define _EXCEPTION_H_
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void installExceptionHandlers(void);
 void iopException(int cause, int badvaddr, int status, int epc, u32 *regs, int repc, char *name);
+void athena_display_crash_screen(const char *title, const char *err_msg);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
