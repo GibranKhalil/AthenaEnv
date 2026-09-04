@@ -1,0 +1,27 @@
+services:
+  build:
+    build: .
+    volumes:
+      - .:/src
+    working_dir: /src
+    environment:
+      - ATHENAENV_SRC=/src/src
+    command: make clean all
+
+  debug:
+    build: .
+    volumes:
+      - .:/src
+    working_dir: /src
+    environment:
+      - ATHENAENV_SRC=/src/src
+    command: make clean debug
+
+  shell:
+    build: .
+    volumes:
+      - .:/src
+    working_dir: /src
+    environment:
+      - ATHENAENV_SRC=/src/src
+    entrypoint: /bin/bash

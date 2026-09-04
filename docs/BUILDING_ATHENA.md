@@ -2,7 +2,37 @@
 
 AthenaEnv is normally distributed on Releases tab or GitHub artifacts for dev binaries, however, there's some relevance to mantain a build instruction manual for customization and preservation purposes.
 
-## What do you need
+## Building with Docker (Recommended)
+
+The easiest and most reliable way to compile AthenaEnv is using Docker, as it eliminates the need to install or compile toolchains locally.
+
+### Prerequisites
+* [Docker Desktop](https://www.docker.com/) (Windows / macOS) or Docker Engine (Linux)
+
+### Build command
+Simply run the helper script or docker compose:
+
+**On Linux / macOS:**
+```shell
+./docker-build.sh
+# or
+docker compose run --rm build
+```
+
+**On Windows:**
+```shell
+docker-build.bat
+# or
+docker compose run --rm build
+```
+
+The compiled binaries will be output to the `bin/` directory (`athena.elf` and `athena_pkd.elf`).
+
+---
+
+## Building Locally (Advanced)
+
+If you prefer to compile on your host machine without Docker:
 
 ### Essential components
 * [Personal Computer](https://en.wikipedia.org/wiki/Personal_computer)
@@ -14,7 +44,7 @@ AthenaEnv is normally distributed on Releases tab or GitHub artifacts for dev bi
 
 _P.S.: Install and usage instructions are inside their pages._
 
-## Compiling
+## Compiling locally
 Once you have PS2DEV environment working on your computer, you can compile AthenaEnv.  
   
 AthenaEnv is easily compilable with a single command ```make```. Two AthenaEnv binary variants will be generated at bin folder.  
