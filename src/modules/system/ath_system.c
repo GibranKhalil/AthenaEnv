@@ -4,6 +4,7 @@
 #include <kernel.h>
 
 #include <ath_env.h>
+#include "ath_system.h"
 #include <memory.h>
 #include <dbgprintf.h>
 

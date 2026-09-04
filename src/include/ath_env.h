@@ -26,7 +26,6 @@ jmp_buf *get_reset_buf();
 void set_default_script(const char* path);
 
 JSModuleDef *athena_push_module(JSContext* ctx, JSModuleInitFunc *func, const JSCFunctionListEntry *func_list, int len, const char* module_name);
-JSModuleDef *athena_system_init(JSContext* ctx);
 
 #endif
 

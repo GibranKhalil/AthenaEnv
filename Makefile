@@ -38,11 +38,17 @@ endif
 JS_CORE = quickjs/cutils.o quickjs/libbf.o quickjs/libregexp.o quickjs/libunicode.o \
           quickjs/realpath.o quickjs/quickjs.o quickjs/quickjs-libc.o
 
+-include Makefile.modules
+
+MODULE_OBJS = $(MODULE_SRCS:src/%.c=%.o)
+EE_LIBS += $(MODULE_LIBS)
+EE_INCS += $(MODULE_INCS)
+
 APP_CORE = main.o memory.o ee_tools.o module_system.o iop_manager.o strUtils.o system.o excepHandler.o exceptions.o sioprintf.o athena_math.o
 
 INI_READER = readini/src/readini.o
 
-ATHENA_MODULES = ath_env.o ath_system.o
+JS_ENGINE = js_api/ath_env.o
 
 IOP_MODULES = iomanx.o filexio.o sio2man.o mcman.o mcserv.o padman.o \
               usbd.o bdm.o bdmfs_fatfs.o usbmass_bd.o cdfs.o \
@@ -50,8 +56,7 @@ IOP_MODULES = iomanx.o filexio.o sio2man.o mcman.o mcserv.o padman.o \
 
 EMBEDDED_ELFS = loader_elf.o
 
-ATHENA_MODULES := $(ATHENA_MODULES:%=$(JS_API_DIR)%)
-EE_OBJS = $(APP_CORE) $(INI_READER) $(JS_CORE) $(ATHENA_MODULES) $(IOP_MODULES) $(EMBEDDED_ELFS)
+EE_OBJS = $(APP_CORE) $(INI_READER) $(JS_CORE) $(JS_ENGINE) $(MODULE_OBJS) $(IOP_MODULES) $(EMBEDDED_ELFS)
 EE_OBJS := $(EE_OBJS:%=$(EE_OBJ_DIR)%)
 
 EE_BIN := $(EE_BIN_DIR)$(EE_BIN_PREF)$(EE_EXT)

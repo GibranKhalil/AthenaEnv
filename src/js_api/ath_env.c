@@ -5,6 +5,7 @@
 #include <errno.h>
 
 #include <ath_env.h>
+#include <athena_module.h>
 #include <memory.h>
 
 #define TRUE 1
@@ -89,13 +90,11 @@ static int qjs_handle_fh(JSContext *ctx, FILE *f, const char *filename) {
 
     // Bootstrap global namespaces
     {
-        const char *str = 
+        const char *base_bootstrap = 
             "import * as std from 'std';\n"
             "import * as os from 'os';\n"
-            "import * as System from 'System';\n"
             "globalThis.std = std;\n"
             "globalThis.os = os;\n"
-            "globalThis.System = System;\n"
             "globalThis.setTimeout = os.setTimeout;\n"
             "globalThis.setInterval = os.setInterval;\n"
             "globalThis.setImmediate = os.setImmediate;\n"
@@ -103,10 +102,19 @@ static int qjs_handle_fh(JSContext *ctx, FILE *f, const char *filename) {
             "globalThis.clearInterval = os.clearInterval;\n"
             "globalThis.clearImmediate = os.clearImmediate;\n";
 
-        rc = qjs_eval_buf(ctx, str, strlen(str), "<bootstrap>", JS_EVAL_TYPE_MODULE);
+        rc = qjs_eval_buf(ctx, base_bootstrap, strlen(base_bootstrap), "<bootstrap-base>", JS_EVAL_TYPE_MODULE);
         if (rc != 0) { 
             free(buf);
             return retval; 
+        }
+
+        const char *modules_bootstrap = athena_get_modules_bootstrap_script();
+        if (modules_bootstrap && modules_bootstrap[0] != '\0') {
+            rc = qjs_eval_buf(ctx, modules_bootstrap, strlen(modules_bootstrap), "<bootstrap-modules>", JS_EVAL_TYPE_MODULE);
+            if (rc != 0) {
+                free(buf);
+                return retval;
+            }
         }
     }
 
@@ -141,8 +149,8 @@ static JSContext *JS_NewCustomContext(JSRuntime *rt)
     js_init_module_std(ctx, "std");
     js_init_module_os(ctx, "os");
 
-    /* Athena minimal Core system module */
-    athena_system_init(ctx);
+    /* Register all configured Athena modules */
+    athena_register_all_modules(ctx);
 
     return ctx;
 }
@@ -151,6 +159,7 @@ static char error_buf[4096];
 
 void destroy_vm(JSContext* ctx) {
     JSRuntime* rt = JS_GetRuntime(ctx);
+    athena_cleanup_all_modules(ctx);
     js_std_free_handlers(rt);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);

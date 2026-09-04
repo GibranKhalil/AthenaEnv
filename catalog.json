@@ -1,0 +1,46 @@
+{
+  "name": "AthenaEnv Module Catalog",
+  "version": "2.0.0",
+  "generatedAt": "2026-09-04T19:51:19.303Z",
+  "modules": [
+    {
+      "id": "pad",
+      "name": "Gamepad Controller (Pads)",
+      "description": "Controller support for PS2 DualShock 2 and digital gamepads: buttons, analog sticks, rumble (vibration), and connection states.",
+      "category": "Input",
+      "version": "1.0.0",
+      "required": false,
+      "default": true,
+      "dependencies": {
+        "modules": [
+          "system"
+        ],
+        "iop": [
+          "sio2man",
+          "padman"
+        ],
+        "ee_libs": [
+          "-lpad"
+        ]
+      },
+      "global_alias": "Pads"
+    },
+    {
+      "id": "system",
+      "name": "System Core",
+      "description": "Core system utilities: high-resolution timers, memory usage statistics, explicit garbage collection, and process controls.",
+      "category": "Core",
+      "version": "1.0.0",
+      "required": true,
+      "default": true,
+      "dependencies": {
+        "modules": [],
+        "iop": [
+          "freeram"
+        ],
+        "ee_libs": []
+      },
+      "global_alias": "System"
+    }
+  ]
+}
