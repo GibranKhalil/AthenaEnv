@@ -20,9 +20,17 @@ ARG USERNAME=developer
 ARG USER_UID=1000
 ARG USER_GID=1000
 
-# Create non-root user and ensure permissions on workdir
-RUN groupadd --gid ${USER_GID} ${USERNAME} 2>/dev/null || true && \
-    useradd --uid ${USER_UID} --gid ${USER_GID} -m -s /bin/bash ${USERNAME} 2>/dev/null || true && \
+# Create non-root user (compatible with Alpine Linux and Debian/Ubuntu)
+RUN set -e; \
+    if id "${USERNAME}" >/dev/null 2>&1; then \
+        echo "User ${USERNAME} already exists"; \
+    elif command -v adduser >/dev/null 2>&1 && [ ! -x /usr/sbin/useradd ]; then \
+        addgroup -g "${USER_GID}" "${USERNAME}" 2>/dev/null || true; \
+        adduser -D -u "${USER_UID}" -G "${USERNAME}" -s "$(command -v bash || echo /bin/sh)" "${USERNAME}"; \
+    else \
+        groupadd -g "${USER_GID}" "${USERNAME}" 2>/dev/null || true; \
+        useradd -u "${USER_UID}" -g "${USER_GID}" -m -s "$(command -v bash || echo /bin/sh)" "${USERNAME}"; \
+    fi && \
     mkdir -p /src && \
     chown -R ${USER_UID}:${USER_GID} /src
 
