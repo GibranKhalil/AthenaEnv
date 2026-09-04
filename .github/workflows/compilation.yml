@@ -41,14 +41,8 @@ jobs:
 
       - name: Prepare distribution bundle
         run: |
-          mkdir -p dist/AthenaEnv
-          # Copy executables
-          cp bin/*.elf dist/AthenaEnv/
-          # Copy developer assets & starter files
-          cp athena.d.ts dist/AthenaEnv/ 2>/dev/null || true
-          cp jsconfig.json dist/AthenaEnv/ 2>/dev/null || true
-          cp main.js dist/AthenaEnv/ 2>/dev/null || true
-          # Create archive
+          mkdir -p dist
+          cp -r bin dist/AthenaEnv
           cd dist
           tar -zcvf ../AthenaEnv.tar.gz AthenaEnv
           cd ..
