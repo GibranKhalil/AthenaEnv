@@ -9,6 +9,7 @@
 #include <memory.h>
 #include <strUtils.h>
 #include <ath_env.h>
+#include <def_mods.h>
 
 #define NEWLIB_PORT_AWARE
 #include <fileXio_rpc.h>
@@ -89,15 +90,34 @@ static void export_symbols() {
             }
         }
         if (!prohibit)
-            erl_add_global_symbol(p->name, p->pointer);
+            erl_add_global_symbol(p->name, (u32)p->pointer);
     }
+}
+
+static IniReader *active_ini = NULL;
+
+static int apply_ini_module_config(void *mod) {
+    module_entry *module = (module_entry *)mod;
+    if (module && active_ini) {
+        if (readini_bool(active_ini, module->name, &module->start_at_boot)) {
+            dbgprintf("[AthenaCore] Config auto-start %s\n", module->name);
+        }
+    }
+    return 0;
+}
+
+static int apply_start_module(void *mod) {
+    module_entry *module = (module_entry *)mod;
+    if (module && module->start_at_boot) {
+        iopman_load_module(module, 0, NULL);
+    }
+    return 0;
 }
 
 int main(int argc, char **argv) {
     IniReader ini;
     bool ignore_ini = false;
     bool reset_iop = true;
-    char newCWD[255];
 
     init_memory_manager();
     register_iop_modules();
@@ -151,11 +171,12 @@ int main(int argc, char **argv) {
         if (!strncmp(boot_path, "mass", 4)) {
             char temp_path[255];
             if (!strncmp(boot_path, "mass:", 5)) {
-                strcpy(temp_path, "mass0:");
-                strncat(temp_path, boot_path + 5, sizeof(temp_path) - strlen(temp_path) - 1);
+                snprintf(temp_path, sizeof(temp_path), "mass0:%s", boot_path + 5);
                 chdir(temp_path);
             } else {
-                strcpy(temp_path, boot_path);
+                strncpy(temp_path, boot_path, sizeof(temp_path) - 1);
+                temp_path[sizeof(temp_path) - 1] = '\0';
+
                 for (int i = 0; i < 5; i++) {
                     temp_path[4] = '0' + i;
                     wait_device(temp_path);
@@ -168,7 +189,8 @@ int main(int argc, char **argv) {
                     } 
                 }
             }
-            strcpy(boot_path, temp_path); 
+            strncpy(boot_path, temp_path, sizeof(boot_path) - 1);
+            boot_path[sizeof(boot_path) - 1] = '\0';
         }
 
         wait_device(boot_path);
@@ -188,19 +210,17 @@ int main(int argc, char **argv) {
         }
             
         if (readini_open(&ini, default_cfg)) {
+            active_ini = &ini;
             while (readini_getline(&ini)) {
                 if (readini_emptyline(&ini)) {
                     continue;
                 } else if (readini_string(&ini, "default_script", default_script)) {
                     dbgprintf("[AthenaCore] Config default_script: %s\n", default_script);
                 } else {
-                    iopman_modules_apply(lambda(void, (module_entry *module) { 
-                        if (readini_bool(&ini, module->name, &module->start_at_boot)) {
-                            dbgprintf("[AthenaCore] Config auto-start %s\n", module->name);
-                        }
-                    }));
+                    iopman_modules_apply(apply_ini_module_config);
                 }
             }
+            active_ini = NULL;
             readini_close(&ini);
         }
     }
@@ -208,11 +228,7 @@ int main(int argc, char **argv) {
     installExceptionHandlers();
 
     if (reset_iop) {
-        iopman_modules_apply(lambda(void, (module_entry *module) { 
-            if (module->start_at_boot) {
-                iopman_load_module(module, 0, NULL);
-            }
-        }));
+        iopman_modules_apply(apply_start_module);
     }
 
     export_symbols();

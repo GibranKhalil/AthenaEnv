@@ -23,7 +23,7 @@ char* strpre(const char *pre, const char *str);
 
 int count_spaces(const char *str, const char *chars);
 
-count_nonascii(const char *str);
+int count_nonascii(const char *str);
 
 #ifdef __cplusplus
 }
