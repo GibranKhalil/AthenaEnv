@@ -11,6 +11,7 @@ extern "C" {
 
 #define ATH_PAD_MAX_PORTS 2
 #define ATH_PAD_MAX_SLOTS 4
+#define PAD_REOPEN_RETRY_INTERVAL 60
 
 typedef struct {
     int connected;
