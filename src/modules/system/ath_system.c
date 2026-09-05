@@ -27,7 +27,7 @@ static JSValue athena_system_sleep(JSContext *ctx, JSValue this_val, int argc, J
         return JS_EXCEPTION;
     }
     if (ms > 0) {
-        usleep(ms * 1000);
+        usleep((useconds_t)((int64_t)ms * 1000));
     }
     return JS_UNDEFINED;
 }
