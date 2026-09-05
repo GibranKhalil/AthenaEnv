@@ -13,6 +13,7 @@ static char actAlign[6];
 static ath_pad_state_t g_pad_states[ATH_PAD_MAX_PORTS][ATH_PAD_MAX_SLOTS];
 static int pad_initialized[ATH_PAD_MAX_PORTS][ATH_PAD_MAX_SLOTS];
 static int last_pad_state[ATH_PAD_MAX_PORTS][ATH_PAD_MAX_SLOTS];
+static int pad_open_retry_countdown[ATH_PAD_MAX_PORTS][ATH_PAD_MAX_SLOTS];
 
 static int pad_slot_opened[ATH_PAD_MAX_PORTS][ATH_PAD_MAX_SLOTS];
 
