@@ -1659,6 +1659,11 @@ declare namespace Ease {
  * Glyphs keep their proportions on NTSC, PAL, 480p and 16:9 modes, and follow
  * `Screen.setMode()`.
  *
+ * A glyph is rasterized the first time it is printed, which can hold that
+ * frame: `preload()` (or the `preload` option of `loadAsync`) does it ahead,
+ * a few milliseconds per frame. Text printed every frame is cheaper through
+ * `render()`, which lays it out once.
+ *
  * @example
  * ```js
  * const title = new Font("fonts/title.ttf", { size: 48 });
@@ -1673,24 +1678,32 @@ declare class Font {
     constructor(options: Font.Options);
 
     /**
-     * Loads a TrueType font without stalling the frame loop: the file is read
-     * on the shared job pool, then the Font is created on the script thread
-     * when the job is awaited or polled. Bitmap fonts load with `new Font()`.
+     * Loads a font without stalling the frame loop. A TrueType file is read
+     * on the shared job pool; a bitmap font's image and `.dat` widths are
+     * decoded there, and its texture is uploaded when first drawn. The Font
+     * is created on the script thread when the job is awaited or polled.
+     *
+     * With `preload`, the job resolves only once those glyphs are rasterized,
+     * `budgetMs` per frame, so a loading screen hands over a font that prints
+     * without a stall.
      *
      * @example
      * ```js
      * async function start() {
-     *     const title = await Font.loadAsync("fonts/title.ttf", { size: 48 });
+     *     const title = await Font.loadAsync("fonts/title.ttf", { size: 48, preload: true });
      *     Loop.run(() => title.print(40, 40, "Ready"));
      * }
      * start();
      * ```
      */
-    static loadAsync(path?: string | null, options?: Font.Options): Font.Job;
-    /** Same as `job.poll()`, `job.wait()` and `job.cancel()`. */
+    static loadAsync(path?: string | null, options?: Font.AsyncOptions): Font.Job;
+    /** Same as `job.poll()`, `job.wait()` and `job.cancel()`. `wait()` also finishes the preloading. */
     static poll(job: Font.Job): AthenaJobStatus<Font>;
     static wait(job: Font.Job, timeoutMs?: number): AthenaJobStatus<Font>;
     static cancel(job: Font.Job): void;
+
+    /** The printable ASCII characters, from space to `~`: what `preload()` rasterizes by default. */
+    static readonly ASCII: string;
 
     static readonly ALIGN_TOP: number;
     static readonly ALIGN_BOTTOM: number;
@@ -1722,8 +1735,26 @@ declare class Font {
     print(x: number, y: number, text: string): void;
     /** Width of the widest line and height of all lines, in pixels. */
     getTextSize(text: string): { width: number; height: number };
-    /** Keeps `text` ready to print repeatedly. */
+    /**
+     * Keeps `text` ready to print repeatedly: its glyphs are placed once and
+     * placed again only when `scale`, `align` or the video mode change. The
+     * outline or shadow reuse the same placement.
+     */
     render(text: string): FontRender;
+    /**
+     * Rasterizes the glyphs of `chars` (by default `Font.ASCII`) ahead of the
+     * first print, spending at most `budgetMs` (default 2) per frame; `0`
+     * rasterizes them all now. The first slice runs during the call, the
+     * next ones once per frame, also before `Loop.run()` starts. Resolves
+     * with the font; rejects if it is freed meanwhile. Bitmap fonts resolve
+     * at once.
+     *
+     * @example
+     * ```js
+     * await hud.preload("0123456789:/ ", { budgetMs: 1 });
+     * ```
+     */
+    preload(chars?: string, options?: Font.PreloadOptions): Promise<Font>;
     /**
      * Releases the font now instead of when the collector finds the object.
      * Using it afterwards throws; FontRender objects made from it throw too.
@@ -1738,8 +1769,18 @@ declare namespace Font {
     }
 
     interface Options {
-        /** TrueType rasterization size in pixels, 6 to 128; defaults to 26. */
+        /** TrueType rasterization size in pixels, 6 to 128; defaults to 26. Ignored by bitmap fonts. */
         size?: number;
+    }
+
+    interface PreloadOptions {
+        /** Milliseconds of rasterization per frame at most; `0` does it all at once. Defaults to 2. */
+        budgetMs?: number;
+    }
+
+    interface AsyncOptions extends Options, PreloadOptions {
+        /** Glyphs rasterized before the job resolves: a string of characters, or `true` for `Font.ASCII`. */
+        preload?: string | boolean;
     }
 }
 
