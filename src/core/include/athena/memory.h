@@ -6,6 +6,8 @@
 
 extern char __start;
 extern char _end;
+/* Main thread stack size: the value is the symbol's address. */
+extern char _stack_size;
 
 void init_memory_manager();
 

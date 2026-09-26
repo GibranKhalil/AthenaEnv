@@ -93,6 +93,25 @@ AthenaFont *athena_font_from_memory(const char *path, void *data, int data_size,
     return font;
 }
 
+AthenaFont *athena_font_from_bitmap(GSFONT *data) {
+    AthenaFont *font;
+
+    if (!data)
+        return NULL;
+    font = font_new();
+    if (!font)
+        return NULL;
+    font->type = ATHENA_FONT_TYPE_IMAGE;
+    font->data = data;
+    return font;
+}
+
+int athena_font_preload(AthenaFont *font, const char *text, int *offset, float budget_ms) {
+    if (!font || font->type != ATHENA_FONT_TYPE_TRUETYPE)
+        return 1;
+    return fntPreload(font->id, text, offset, budget_ms);
+}
+
 int athena_font_get_line_height(AthenaFont *font) {
     if (!font)
         return 0;
@@ -195,14 +214,33 @@ AthenaFontRender *athena_font_render_create(AthenaFont *font, const char *text) 
 void athena_font_render_destroy(AthenaFontRender *render) {
     if (!render)
         return;
+    fntLayoutFree(render->layout);
     free(render->text);
     free(render);
 }
 
 void athena_font_render_print(AthenaFontRender *render, float x, float y) {
+    AthenaFont *font;
+
     if (!render || !render->font || !render->text)
         return;
-    athena_font_print(render->font, x, y, render->text);
+    font = render->font;
+    if (font->type != ATHENA_FONT_TYPE_TRUETYPE) {
+        athena_font_print(font, x, y, render->text);
+        return;
+    }
+    if (!render->layout)
+        render->layout = fntLayoutNew();
+    if (!render->layout) {
+        athena_font_print(font, x, y, render->text);
+        return;
+    }
+    if (!fntLayoutMatches(render->layout, font->id, (short)font->align, 0, 0, font->scale) &&
+        !fntLayout(render->layout, font->id, (short)font->align, 0, 0, render->text, font->scale))
+        return;
+    fntLayoutDraw(render->layout, (int)x, (int)y, font->color,
+                  font->outline, font->outline_color,
+                  font->dropshadow, font->dropshadow_color);
 }
 
 Coords athena_font_render_get_size(const AthenaFontRender *render) {

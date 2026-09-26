@@ -1,6 +1,6 @@
 /*
  * Deep recursion must throw a catchable "stack overflow" on the main thread
- * (128 KB stack) and on JavaScript threads (their own, smaller stack),
+ * (512 KB stack, MAIN_STACK_SIZE) and on JavaScript threads (their own, smaller stack),
  * instead of running past the real stack and corrupting memory.
  */
 let passed = 0, failed = 0;
@@ -40,8 +40,14 @@ for (const stack of [undefined, 16384]) {
     Thread.destroy(thread);
 }
 
-// Ordinary recursion still has room.
+// Ordinary recursion still has room, and how deep the main thread goes.
 function depth(n) { return n === 0 ? 0 : depth(n - 1) + 1; }
-check("1000 frames on the main thread", depth(1000) === 1000);
+let reached = 0;
+function probe(n) { reached = n; probe(n + 1); }
+try { probe(0); } catch (error) { }
+console.log(`[INFO] main thread recursion depth before the overflow: ${reached}`);
+let result;
+try { result = depth(1000); } catch (error) { result = String(error); }
+check("1000 frames on the main thread: " + result, result === 1000);
 
 console.log(`Result: ${passed} passed, ${failed} failed`);

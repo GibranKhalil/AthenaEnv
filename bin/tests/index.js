@@ -40,6 +40,7 @@ const STATUS = {
     finished: { text: "finished", color: GREEN },
     exited: { text: "left with SELECT+START", color: YELLOW },
     error: { text: "error", color: RED },
+    reloaded: { text: "came back with std.reload()", color: GREEN },
 };
 const status = last && STATUS[last.status] ?
     { text: `${baseName(last.script)}: ${STATUS[last.status].text}`, color: STATUS[last.status].color } : null;

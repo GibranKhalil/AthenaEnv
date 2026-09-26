@@ -78,7 +78,8 @@ void free(void* ptr) {
 
 void init_memory_manager() {
     prog_mem.binary_size = (unsigned long)&_end - (unsigned long)&__start;
-    prog_mem.stack_size = 0x20000;
+    /* Linker symbol whose address is the size (MAIN_STACK_SIZE in the Makefile). */
+    prog_mem.stack_size = (size_t)&_stack_size;
 }
 
 size_t get_binary_size() {  return prog_mem.binary_size;    }

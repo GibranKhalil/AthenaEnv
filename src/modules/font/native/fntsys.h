@@ -66,6 +66,37 @@ int fntGetSize(int id);
  */
 void fntUpdateAspectRatio();
 
+/**
+ * A text laid out once: its glyphs as quads grouped by atlas, to draw again
+ * (with outline or shadow) without measuring and decoding the text again.
+ */
+typedef struct fnt_layout fnt_layout_t;
+
+fnt_layout_t *fntLayoutNew(void);
+void fntLayoutFree(fnt_layout_t *layout);
+
+/** Lays out `string` relative to the origin, as fntRenderString() would place it. 0 on failure. */
+int fntLayout(fnt_layout_t *layout, int id, short aligned, size_t width, size_t height,
+    const char *string, float scale);
+
+/**
+ * Whether the layout still holds for the same text with these settings: a
+ * new video mode or a flushed glyph cache moves the glyphs.
+ */
+int fntLayoutMatches(const fnt_layout_t *layout, int id, short aligned, size_t width,
+    size_t height, float scale);
+
+/** Draws a layout at (x, y): one packet per atlas holding the outline or shadow copies and the text. */
+void fntLayoutDraw(const fnt_layout_t *layout, int x, int y, u64 colour, float outline,
+    u64 outline_colour, float dropshadow, u64 dropshadow_colour);
+
+/**
+ * Rasterizes the glyphs of `text` into the cache, from byte `*offset`, for
+ * up to `budget_ms` (no limit when <= 0). Returns 1 once the end is reached,
+ * or 0 with `*offset` at the next character to continue from.
+ */
+int fntPreload(int id, const char *text, int *offset, float budget_ms);
+
 int fntRenderStringPlus(int id, int x, int y, short aligned, size_t width, size_t height, const char *string, float scale, u64 colour, float outline, u64 outline_colour, float dropshadow, u64 dropshadow_colour);
 
 /** Renders a text with specified window dimensions; `\n` starts a new line. */
@@ -79,5 +110,13 @@ int fntGetLineHeight(int id, float scale);
 
 /** Width of the widest line and height of all lines. */
 Coords fntGetTextSize(int id, const char* text, float scale);
+
+/*
+ * loadFont() (athena/graphics.h) decodes a bitmap font into CPU memory only;
+ * its texture is uploaded when first drawn, so it is safe on a worker thread.
+ * athena_bitmap_font_discard() frees one that was never drawn, without the
+ * texture manager: safe on any thread.
+ */
+void athena_bitmap_font_discard(GSFONT *font);
 
 #endif

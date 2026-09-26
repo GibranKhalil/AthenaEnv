@@ -373,7 +373,188 @@ static JSValue font_set_color(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
-/* ---- Font.loadAsync: the file is read on the job pool ---- */
+/* ---- Glyph preloading: rasterized a slice per frame ---- */
+
+/* Printable ASCII, the default set of font.preload() and the loadAsync `preload` option. */
+#define FONT_ASCII " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+/* Rasterization time per frame when `budgetMs` is not given. */
+#define FONT_PRELOAD_BUDGET_MS 2.0
+
+/*
+ * Reads an optional `budgetMs` into `budget`, left untouched when absent;
+ * 0 on error, with an exception pending.
+ */
+static int font_budget_option(JSContext *ctx, JSValueConst options, double *budget,
+    const char *name)
+{
+    JSValue value = JS_GetPropertyStr(ctx, options, "budgetMs");
+    int ok = 1;
+
+    if (JS_IsException(value))
+        return 0;
+    if (!JS_IsUndefined(value)) {
+        if (!JS_IsNumber(value) || JS_ToFloat64(ctx, budget, value) ||
+            !isfinite(*budget) || *budget < 0) {
+            JS_ThrowRangeError(ctx, "%s budgetMs must be a non-negative number of milliseconds", name);
+            ok = 0;
+        }
+    }
+    JS_FreeValue(ctx, value);
+    return ok;
+}
+
+/* Calls `func(arg)` and drops the result; -1 when it threw. */
+static int font_call1(JSContext *ctx, JSValueConst func, JSValueConst arg)
+{
+    JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 1, &arg);
+
+    if (JS_IsException(ret))
+        return -1;
+    JS_FreeValue(ctx, ret);
+    return 0;
+}
+
+/*
+ * Runs `func` in `delay_ms` through the event loop's timers. With the Loop
+ * running, expired timers run once per frame, between the flip and the next
+ * frame; a delay of 1 ms keeps a timer that schedules itself from running
+ * twice in the same frame.
+ */
+static int font_set_timeout(JSContext *ctx, JSValue func, int delay_ms)
+{
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue set_timeout = JS_GetPropertyStr(ctx, global, "setTimeout");
+    JSValue args[2], ret;
+
+    JS_FreeValue(ctx, global);
+    if (JS_IsException(func) || !JS_IsFunction(ctx, set_timeout)) {
+        JS_FreeValue(ctx, func);
+        JS_FreeValue(ctx, set_timeout);
+        if (!JS_IsException(func))
+            JS_ThrowInternalError(ctx, "Font.preload needs setTimeout");
+        return -1;
+    }
+    args[0] = func;
+    args[1] = JS_NewInt32(ctx, delay_ms);
+    ret = JS_Call(ctx, set_timeout, JS_UNDEFINED, 2, args);
+    JS_FreeValue(ctx, func);
+    JS_FreeValue(ctx, set_timeout);
+    if (JS_IsException(ret))
+        return -1;
+    JS_FreeValue(ctx, ret);
+    return 0;
+}
+
+static JSValue font_preload_tick(JSContext *ctx, JSValueConst this_val, int argc,
+    JSValueConst *argv, int magic, JSValue *data);
+
+/* The preload in progress, kept in the timer function's data. */
+enum {
+    PRELOAD_FONT,       /* the Font object */
+    PRELOAD_TEXT,       /* the characters, a string */
+    PRELOAD_OFFSET,     /* UTF-8 byte of the next character */
+    PRELOAD_BUDGET,     /* milliseconds per slice */
+    PRELOAD_RESOLVE,
+    PRELOAD_REJECT,
+    PRELOAD_COUNT
+};
+
+/*
+ * One slice: rasterizes glyphs until the budget is spent, then resolves the
+ * promise with the font or schedules the next slice. 0, or -1 with an
+ * exception pending.
+ */
+static int font_preload_slice(JSContext *ctx, JSValueConst *data)
+{
+    AthenaFont *font = JS_GetOpaque(data[PRELOAD_FONT], font_class_id);
+    const char *text;
+    int32_t offset;
+    double budget;
+    JSValue next[PRELOAD_COUNT];
+    int done, i, position;
+
+    if (!font || font == &font_freed) {
+        JSValue error;
+        JS_ThrowTypeError(ctx, "Font.preload: the Font was freed");
+        error = JS_GetException(ctx);
+        i = font_call1(ctx, data[PRELOAD_REJECT], error);
+        JS_FreeValue(ctx, error);
+        return i;
+    }
+    if (JS_ToInt32(ctx, &offset, data[PRELOAD_OFFSET]) ||
+        JS_ToFloat64(ctx, &budget, data[PRELOAD_BUDGET]))
+        return -1;
+    text = JS_ToCString(ctx, data[PRELOAD_TEXT]);
+    if (!text)
+        return -1;
+    position = offset;
+    done = athena_font_preload(font, text, &position, (float)budget);
+    JS_FreeCString(ctx, text);
+    if (done)
+        return font_call1(ctx, data[PRELOAD_RESOLVE], data[PRELOAD_FONT]);
+
+    for (i = 0; i < PRELOAD_COUNT; i++)
+        next[i] = data[i];
+    next[PRELOAD_OFFSET] = JS_NewInt32(ctx, position);
+    return font_set_timeout(ctx, JS_NewCFunctionData(ctx,
+        font_preload_tick, 0, 0, PRELOAD_COUNT, next), 1);
+}
+
+static JSValue font_preload_tick(JSContext *ctx, JSValueConst this_val, int argc,
+    JSValueConst *argv, int magic, JSValue *data)
+{
+    return font_preload_slice(ctx, (JSValueConst *)data) < 0 ? JS_EXCEPTION : JS_UNDEFINED;
+}
+
+/*
+ * font.preload(chars = Font.ASCII, { budgetMs = 2 }): rasterizes the glyphs
+ * ahead of the first print, `budgetMs` per frame (0: all now). Resolves with
+ * the font.
+ */
+static JSValue font_preload(JSContext *ctx, JSValueConst this_val, int argc,
+    JSValueConst *argv)
+{
+    AthenaFont *font = font_this(ctx, this_val);
+    const char *name = "Font.preload";
+    double budget = FONT_PRELOAD_BUDGET_MS;
+    JSValue data[PRELOAD_COUNT], funcs[2], promise;
+    int i, failed;
+
+    if (!font || !font_argc(ctx, argc, 0, 2, name))
+        return JS_EXCEPTION;
+    if (argc >= 1 && !JS_IsUndefined(argv[0]) && !JS_IsString(argv[0]))
+        return JS_ThrowTypeError(ctx, "%s characters must be a string", name);
+    if (argc == 2 && !JS_IsUndefined(argv[1])) {
+        if (!JS_IsObject(argv[1]) || JS_IsArray(ctx, argv[1]))
+            return JS_ThrowTypeError(ctx, "%s options must be an object", name);
+        if (!font_budget_option(ctx, argv[1], &budget, name))
+            return JS_EXCEPTION;
+    }
+
+    promise = JS_NewPromiseCapability(ctx, funcs);
+    if (JS_IsException(promise))
+        return promise;
+    data[PRELOAD_FONT] = JS_DupValue(ctx, this_val);
+    data[PRELOAD_TEXT] = argc >= 1 && JS_IsString(argv[0]) ?
+        JS_DupValue(ctx, argv[0]) : JS_NewString(ctx, FONT_ASCII);
+    data[PRELOAD_OFFSET] = JS_NewInt32(ctx, 0);
+    data[PRELOAD_BUDGET] = JS_NewFloat64(ctx, budget);
+    data[PRELOAD_RESOLVE] = funcs[0];
+    data[PRELOAD_REJECT] = funcs[1];
+
+    /* The first slice runs now: a few characters are done without waiting a frame. */
+    failed = JS_IsException(data[PRELOAD_TEXT]) || font_preload_slice(ctx, data) < 0;
+    for (i = 0; i < PRELOAD_COUNT; i++)
+        JS_FreeValue(ctx, data[i]);
+    if (failed) {
+        JS_FreeValue(ctx, promise);
+        return JS_EXCEPTION;
+    }
+    return promise;
+}
+
+/* ---- Font.loadAsync: the file is read (TrueType) or decoded (bitmap) on the job pool ---- */
 
 /* Errors of the read job. */
 #define FONT_READ_FAILED    (-1)
@@ -382,29 +563,49 @@ static JSValue font_set_color(JSContext *ctx, JSValueConst this_val,
 /* Data of the read job; the pool frees it. */
 typedef struct {
     char *path;         /* NULL: the embedded font, nothing to read */
-    void *data;
+    int bitmap;         /* image and .dat, decoded by loadFont() */
+    void *data;         /* TrueType file */
     int length;
+    GSFONT *decoded;    /* bitmap font, CPU memory only */
 } FontRead;
 
-/* Worker: only reads bytes. FreeType is not thread-safe, so the face is created on the script thread. */
+static int font_is_bitmap_path(const char *path)
+{
+    const char *extension = path ? strrchr(path, '.') : NULL;
+
+    return extension && (!strcasecmp(extension, ".png") || !strcasecmp(extension, ".bmp") ||
+        !strcasecmp(extension, ".jpg") || !strcasecmp(extension, ".jpeg"));
+}
+
+/*
+ * Worker: reads the TrueType bytes, or decodes the bitmap font's image and
+ * widths. FreeType and the texture manager are not thread-safe, so the face
+ * is created, and the texture uploaded, on the script thread.
+ */
 static int font_read_run(AthenaJob *job, void *arg)
 {
     FontRead *read = arg;
-    void *data;
+    void *data = NULL;
+    GSFONT *decoded = NULL;
     int length = 0;
 
     if (!read->path)
         return 0;
-    data = fntReadFile(read->path, &length);
+    if (read->bitmap)
+        decoded = loadFont(read->path);
+    else
+        data = fntReadFile(read->path, &length);
     if (athena_job_should_stop(job)) {
         free(data);
+        athena_bitmap_font_discard(decoded);
         return FONT_READ_CANCELLED;
     }
-    if (!data)
+    if (!data && !decoded)
         return FONT_READ_FAILED;
     athena_job_lock(job);
     read->data = data;
     read->length = length;
+    read->decoded = decoded;
     athena_job_unlock(job);
     return 0;
 }
@@ -414,29 +615,78 @@ static void font_read_free(void *arg)
     FontRead *read = arg;
 
     free(read->data);
+    athena_bitmap_font_discard(read->decoded);
     free(read->path);
     free(read);
 }
 
+/* Reading a file mostly waits for the IOP; decoding an image uses the CPU. */
 static const AthenaJobType font_read_type = {
     "Font", font_read_run, font_read_free, FONT_READ_CANCELLED, ATHENA_JOB_PRIORITY_IO,
 };
+static const AthenaJobType font_decode_type = {
+    "Font", font_read_run, font_read_free, FONT_READ_CANCELLED, ATHENA_JOB_PRIORITY_CPU,
+};
 
-/* What the Job object keeps: the options, for the script-thread half. */
+/* What the Job object keeps: the options, and the font while its glyphs are preloaded. */
 typedef struct {
     char *path;
     int size;
+    char *preload;          /* characters to rasterize before resolving, or NULL */
+    float budget_ms;
+    int offset;             /* progress in `preload` */
+    int created;            /* the script-thread half started */
+    int error;              /* ATHENA_FONT_ERR_* when creating the font failed */
+    AthenaFont *font;       /* created, not yet handed to a Font object */
 } FontJobInfo;
 
-/* Creates the Font from the bytes read, on the script thread. */
+/* Creates the font from what the worker read, on the script thread. */
+static void font_job_create(JSContext *ctx, AthenaJob *job, FontJobInfo *info)
+{
+    FontRead *read = athena_job_data(job);
+    int error = ATHENA_FONT_OK;
+
+    info->created = 1;
+    if (read->decoded) {
+        info->font = athena_font_from_bitmap(read->decoded);
+        if (info->font)
+            read->decoded = NULL;
+        else
+            error = ATHENA_FONT_ERR_MEMORY;
+    } else if (read->data) {
+        /* The font takes the bytes on success; on failure they stay ours. */
+        info->font = athena_font_from_memory(info->path, read->data, read->length, info->size, &error);
+        if (!info->font && (error == ATHENA_FONT_ERR_SLOTS || error == ATHENA_FONT_ERR_MEMORY)) {
+            JS_RunGC(JS_GetRuntime(ctx));
+            info->font = athena_font_from_memory(info->path, read->data, read->length, info->size, &error);
+        }
+        if (info->font)
+            read->data = NULL;
+    } else {
+        info->font = athena_font_load_ex(NULL, info->size, &error);
+    }
+    info->error = info->font ? ATHENA_FONT_OK : error;
+}
+
+/* Script-thread half: creates the font, then rasterizes the `preload` glyphs a slice per tick. */
+static int font_job_advance(JSContext *ctx, AthenaJob *job, void *user)
+{
+    FontJobInfo *info = user;
+
+    if (!info->created)
+        font_job_create(ctx, job, info);
+    if (!info->font || !info->preload)
+        return 0;
+    return athena_font_preload(info->font, info->preload, &info->offset, info->budget_ms) ? 0 : 1;
+}
+
+/* Hands the Font to the script, or the reason it could not be loaded. */
 static int font_job_settle(JSContext *ctx, AthenaJob *job, AthenaJobState state, int result,
     void *user, JSValue *outcome, bool *failed)
 {
     FontJobInfo *info = user;
-    FontRead *read = athena_job_data(job);
     const char *name = info->path ? info->path : "default";
     AthenaFont *font;
-    int error;
 
     *failed = true;
     if (state == ATHENA_JOB_CANCELLED) {
@@ -449,24 +699,16 @@ static int font_job_settle(JSContext *ctx, AthenaJob *job, AthenaJobState state,
         *outcome = JS_GetException(ctx);
         return 0;
     }
-
-    if (read->data) {
-        /* The font takes the bytes on success; on failure they stay ours. */
-        font = athena_font_from_memory(info->path, read->data, read->length, info->size, &error);
-        if (!font && (error == ATHENA_FONT_ERR_SLOTS || error == ATHENA_FONT_ERR_MEMORY)) {
-            JS_RunGC(JS_GetRuntime(ctx));
-            font = athena_font_from_memory(info->path, read->data, read->length, info->size, &error);
-        }
-        if (font)
-            read->data = NULL;
-    } else {
-        font = athena_font_load_ex(NULL, info->size, &error);
-    }
-    if (!font) {
-        font_load_error(ctx, info->path, error);
+    if (!info->created)
+        font_job_create(ctx, job, info);
+    if (!info->font) {
+        font_load_error(ctx, info->path, info->error);
         *outcome = JS_GetException(ctx);
         return 0;
     }
+
+    font = info->font;
+    info->font = NULL;          /* font_wrap() takes it, or destroys it */
     *outcome = font_wrap(ctx, JS_UNDEFINED, font);
     if (JS_IsException(*outcome)) {
         *outcome = JS_UNDEFINED;
@@ -480,67 +722,118 @@ static void font_job_free_info(JSRuntime *rt, void *user)
 {
     FontJobInfo *info = user;
 
+    athena_font_destroy(info->font);
+    free(info->preload);
     free(info->path);
     free(info);
 }
 
 static const AthenaJsJobKind font_job_kind = {
-    "Font", font_job_settle, NULL, font_job_free_info,
+    "Font", font_job_settle, NULL, font_job_free_info, NULL, NULL, font_job_advance,
 };
 
-/* Font.loadAsync(path?, { size }): a Job that resolves with the Font. TrueType only. */
+/*
+ * Reads the loadAsync options: { size, preload, budgetMs }. `preload` is a
+ * string of characters, or true for Font.ASCII. 0 on error, with an
+ * exception pending.
+ */
+static int font_async_options(JSContext *ctx, JSValueConst options, FontJobInfo *info,
+    const char *name)
+{
+    double budget = FONT_PRELOAD_BUDGET_MS;
+    JSValue value;
+    const char *chars;
+
+    if (!font_options(ctx, options, &info->size))
+        return 0;
+    info->budget_ms = (float)budget;
+    if (JS_IsUndefined(options))
+        return 1;
+    if (!font_budget_option(ctx, options, &budget, name))
+        return 0;
+    info->budget_ms = (float)budget;
+
+    value = JS_GetPropertyStr(ctx, options, "preload");
+    if (JS_IsException(value))
+        return 0;
+    if (JS_IsUndefined(value) || JS_IsBool(value)) {
+        if (JS_ToBool(ctx, value) && !(info->preload = strdup(FONT_ASCII))) {
+            JS_ThrowOutOfMemory(ctx);
+            return 0;
+        }
+        return 1;
+    }
+    if (!JS_IsString(value)) {
+        JS_FreeValue(ctx, value);
+        JS_ThrowTypeError(ctx, "%s preload must be a string of characters or true", name);
+        return 0;
+    }
+    chars = JS_ToCString(ctx, value);
+    JS_FreeValue(ctx, value);
+    if (!chars)
+        return 0;
+    info->preload = strdup(chars);
+    JS_FreeCString(ctx, chars);
+    if (!info->preload) {
+        JS_ThrowOutOfMemory(ctx);
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * Font.loadAsync(path?, { size, preload, budgetMs }): a Job that resolves
+ * with the Font, after rasterizing the `preload` glyphs when given.
+ */
 static JSValue font_load_async(JSContext *ctx, JSValueConst this_val, int argc,
     JSValueConst *argv)
 {
     const char *name = "Font.loadAsync";
-    JSValueConst options = JS_UNDEFINED;
     const char *path = NULL;
     FontJobInfo *info;
     FontRead *read;
-    int size;
+    int bitmap;
 
     if (!font_argc(ctx, argc, 0, 2, name))
         return JS_EXCEPTION;
     if (argc >= 1 && !JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0]) && !JS_IsString(argv[0]))
         return JS_ThrowTypeError(ctx, "%s path must be a string", name);
-    if (argc == 2)
-        options = argv[1];
-    if (!font_options(ctx, options, &size))
+
+    info = calloc(1, sizeof(*info));
+    if (!info)
+        return JS_ThrowOutOfMemory(ctx);
+    if (!font_async_options(ctx, argc == 2 ? argv[1] : JS_UNDEFINED, info, name)) {
+        font_job_free_info(JS_GetRuntime(ctx), info);
         return JS_EXCEPTION;
+    }
     if (argc >= 1 && JS_IsString(argv[0])) {
-        const char *extension;
         path = JS_ToCString(ctx, argv[0]);
-        if (!path)
+        if (!path) {
+            font_job_free_info(JS_GetRuntime(ctx), info);
             return JS_EXCEPTION;
-        extension = strrchr(path, '.');
-        if (extension && (!strcasecmp(extension, ".png") || !strcasecmp(extension, ".bmp") ||
-            !strcasecmp(extension, ".jpg") || !strcasecmp(extension, ".jpeg"))) {
-            JS_FreeCString(ctx, path);
-            return JS_ThrowTypeError(ctx, "%s loads TrueType fonts; load bitmap fonts with new Font()", name);
         }
         if (!strcmp(path, "default")) {
             JS_FreeCString(ctx, path);
             path = NULL;
         }
     }
+    bitmap = font_is_bitmap_path(path);
 
-    info = calloc(1, sizeof(*info));
     read = calloc(1, sizeof(*read));
-    if (!info || !read || (path && (!(info->path = strdup(path)) || !(read->path = strdup(path))))) {
+    if (!read || (path && (!(info->path = strdup(path)) || !(read->path = strdup(path))))) {
         if (path)
             JS_FreeCString(ctx, path);
-        if (info)
-            free(info->path);
         if (read)
             free(read->path);
-        free(info);
         free(read);
+        font_job_free_info(JS_GetRuntime(ctx), info);
         return JS_ThrowOutOfMemory(ctx);
     }
     if (path)
         JS_FreeCString(ctx, path);
-    info->size = size;
-    return athena_js_job_new(ctx, &font_job_kind, athena_job_submit(&font_read_type, read), info, name);
+    read->bitmap = bitmap;
+    return athena_js_job_new(ctx, &font_job_kind,
+        athena_job_submit(bitmap ? &font_decode_type : &font_read_type, read), info, name);
 }
 
 static JSValue font_job_poll(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
@@ -581,6 +874,7 @@ static const JSCFunctionListEntry font_proto[] = {
     JS_CFUNC_DEF("free", 0, font_free),
     JS_CFUNC_DEF("getTextSize", 1, font_size),
     JS_CFUNC_DEF("render", 1, font_render),
+    JS_CFUNC_DEF("preload", 2, font_preload),
 };
 
 static const JSCFunctionListEntry render_proto[] = {
@@ -596,6 +890,7 @@ static const JSCFunctionListEntry font_exports[] = {
     JS_PROP_INT32_DEF("ALIGN_HCENTER", ALIGN_HCENTER, JS_PROP_CONFIGURABLE),
     JS_PROP_INT32_DEF("ALIGN_NONE", ALIGN_NONE, JS_PROP_CONFIGURABLE),
     JS_PROP_INT32_DEF("ALIGN_CENTER", ALIGN_CENTER, JS_PROP_CONFIGURABLE),
+    JS_PROP_STRING_DEF("ASCII", FONT_ASCII, JS_PROP_CONFIGURABLE),
     JS_CFUNC_DEF("loadAsync", 2, font_load_async),
     JS_CFUNC_DEF("poll", 1, font_job_poll),
     JS_CFUNC_DEF("wait", 2, font_job_wait),

@@ -10,6 +10,7 @@
 #include <math.h>
 #include <unistd.h>
 #include <sys/fcntl.h>
+#include <timer.h>
 #include "fntsys.h"
 #include <athena/utf8.h>
 #include "atlas.h"
@@ -88,6 +89,9 @@ typedef struct
     int atlasSize;
     int refs;
 
+    /// Changes whenever the glyphs move (cache flushed), to invalidate text layouts
+    unsigned generation;
+
     FT_Bool kerning;
 } font_t;
 
@@ -102,7 +106,11 @@ static struct {
 
 #define GLYPH_CACHE_PAGE_SIZE 256
 
+/// Source of font_t::generation values, never reused while the ELF runs
+static unsigned fntGenerations;
+
 static fnt_glyph_cache_entry_t *fntCacheGlyph(font_t *font, uint32_t gid);
+static void fntScratchFree(void);
 
 static font_t *fntGet(int id)
 {
@@ -172,6 +180,7 @@ static void fntCacheFlush(font_t *font)
     free(font->glyphCache);
     font->glyphCache = NULL;
     font->cacheMaxPageID = -1;
+    font->generation = ++fntGenerations;
 
     // free all atlasses too, they're invalid now anyway
     int aid;
@@ -336,6 +345,8 @@ void fntEnd()
     font_library_ready = 0;
 
     fntDestroyCLUT();
+
+    fntScratchFree();
 }
 
 static int fntClampSize(int size)
@@ -403,6 +414,7 @@ int fntLoadMemory(const char *path, void *data, int data_size, int size)
     font->atlasSize = size <= 32 ? 256 : 512;
     font->refs = 1;
     font->kerning = FT_HAS_KERNING(font->face);
+    font->generation = ++fntGenerations;
     font->isValid = 1;
 
     fntCheckVideoMode();
@@ -604,58 +616,163 @@ int fntGetLineHeight(int id, float scale)
     return fntLineHeight(font, scale);
 }
 
-void fntRenderGlyph(fnt_glyph_cache_entry_t *glyph, owl_packet *packet, int pen_x, int pen_y, float scale)
+/*
+ * Text layout: the glyphs of a string placed once, as quads relative to the
+ * text origin and grouped by atlas. Drawing a layout only translates the
+ * quads and emits one packet per atlas, so an outline (4 extra copies) or a
+ * FontRender printed every frame never measures or decodes the text again.
+ */
+
+/** A glyph placed by fntLayout(), relative to the text origin */
+typedef struct
 {
     float x1, y1, x2, y2;
-    float u1, v1, u2, v2;
+    u64 uv1, uv2;
+    // index of the glyph's atlas in font_t::atlases, to group the quads
+    int atlas;
+} fnt_quad_t;
 
-    x1 = (float)pen_x + ((float)glyph->ox * scale)-0.5f;
+struct fnt_layout
+{
+    // what the quads were laid out for (fntLayoutMatches)
+    int id;
+    unsigned generation;
+    short aligned;
+    size_t width, height;
+    float scale;
+    int valid;
 
-    if (GetInterlacedFrameMode()) {
-        y1 = ((float)pen_y + ((float)glyph->oy / 2.0f) * scale)-0.5f;
-        y2 = (y1 + ((float)glyph->height / 2.0f) * scale)-0.5f;
+    fnt_quad_t *quads;
+    int count, capacity;
+
+    // quads[start, start + count) use atlas
+    struct {
+        atlas_t *atlas;
+        int start, count;
+    } runs[ATLAS_MAX];
+    int runCount;
+
+    // pen position after the last glyph, relative to the origin
+    int endX;
+};
+
+/** One copy of the text: an outline or shadow offset, and its colour */
+typedef struct
+{
+    float dx, dy;
+    u64 colour;
+} fnt_pass_t;
+
+/// Layout of the texts printed directly (fntRenderString*), reused by every call
+static fnt_layout_t fntScratch;
+
+static void fntScratchFree(void)
+{
+    free(fntScratch.quads);
+    memset(&fntScratch, 0, sizeof(fntScratch));
+}
+
+fnt_layout_t *fntLayoutNew(void)
+{
+    return calloc(1, sizeof(fnt_layout_t));
+}
+
+void fntLayoutFree(fnt_layout_t *layout)
+{
+    if (!layout)
+        return;
+    free(layout->quads);
+    free(layout);
+}
+
+static int fntLayoutReserve(fnt_layout_t *layout, int count)
+{
+    fnt_quad_t *quads;
+
+    if (count <= layout->capacity)
+        return 1;
+    quads = realloc(layout->quads, count * sizeof(fnt_quad_t));
+    if (!quads)
+        return 0;
+    layout->quads = quads;
+    layout->capacity = count;
+    return 1;
+}
+
+static void fntLayoutAddGlyph(fnt_layout_t *layout, font_t *font, fnt_glyph_cache_entry_t *glyph,
+    int pen_x, int pen_y, float scale)
+{
+    fnt_quad_t *quad;
+    int aid;
+
+    for (aid = 0; aid < ATLAS_MAX && font->atlases[aid] != glyph->atlas; aid++)
+        ;
+    if (aid == ATLAS_MAX || layout->count >= layout->capacity)
+        return;
+
+    quad = &layout->quads[layout->count++];
+    quad->atlas = aid;
+    quad->x1 = (float)pen_x + ((float)glyph->ox * scale) - 0.5f;
+    if (fntVideo.frame == 1) {
+        quad->y1 = ((float)pen_y + ((float)glyph->oy / 2.0f) * scale) - 0.5f;
+        quad->y2 = (quad->y1 + ((float)glyph->height / 2.0f) * scale) - 0.5f;
     } else {
-        y1 = (float)pen_y + ((float)glyph->oy * scale)-0.5f;
-        y2 = y1 + ((float)glyph->height * scale)-0.5f;
+        quad->y1 = (float)pen_y + ((float)glyph->oy * scale) - 0.5f;
+        quad->y2 = quad->y1 + ((float)glyph->height * scale) - 0.5f;
     }
+    quad->x2 = quad->x1 + ((float)glyph->width * scale) - 0.5f;
 
-    x2 = x1 + ((float)glyph->width * scale)-0.5f;
-
-    u1 = glyph->allocation->x;
-    v1 = glyph->allocation->y;
-    u2 = glyph->allocation->x + glyph->width + 0.5f;
-    v2 = glyph->allocation->y + glyph->height + 0.5f;
-
-	owl_add_tag(packet, (uint64_t)(owl_coord_transform(x1, gsGlobal->OffsetX)) | ((uint64_t)(owl_coord_transform(y1, gsGlobal->OffsetY)) << 16), GS_SETREG_UV( owl_uv_transform(u1, 1024), owl_uv_transform(v1, 1024)));
-	owl_add_tag(packet, (uint64_t)(owl_coord_transform(x2, gsGlobal->OffsetX)) | ((uint64_t)(owl_coord_transform(y2, gsGlobal->OffsetY)) << 16), GS_SETREG_UV( owl_uv_transform(u2, 1024), owl_uv_transform(v2, 1024)));
+    quad->uv1 = GS_SETREG_UV(owl_uv_transform(glyph->allocation->x, 1024),
+        owl_uv_transform(glyph->allocation->y, 1024));
+    quad->uv2 = GS_SETREG_UV(owl_uv_transform(glyph->allocation->x + glyph->width + 0.5f, 1024),
+        owl_uv_transform(glyph->allocation->y + glyph->height + 0.5f, 1024));
 }
 
-/*
- * Glyphs of one atlas are sent as one GIF packet whose sizes were reserved
- * for every glyph left in the string. Writes the sizes actually used once
- * the run ends: glyphs without a bitmap (spaces, tabs, missing characters)
- * reserved room they did not fill.
- */
-static void fntFinishRun(owl_qword *cnt, owl_qword *direct, owl_qword *reglist,
-    owl_qword *first, owl_qword *end, int texture_id)
+static int fntCompareQuads(const void *a, const void *b)
 {
-    int size = (int)(((uint32_t)end - (uint32_t)first) / 16);
-
-    cnt->dword[0] = DMA_TAG((texture_id != -1 ? 11 : 7) + size, 0, DMA_CNT, 0, 0, 0);
-    direct->sword[3] = VIF_CODE(6 + size, 0, VIF_DIRECT, 0);
-    reglist->dword[0] = VU_GS_GIFTAG(size, 1, NO_CUSTOM_DATA, 0, 0, 1, 2);
+    return ((const fnt_quad_t *)a)->atlas - ((const fnt_quad_t *)b)->atlas;
 }
 
-int fntRenderString(int id, int x, int y, short aligned, size_t width, size_t height, const char *string, float scale, u64 colour)
+/* Groups the quads by atlas: the order within the text does not matter to the GS. */
+static void fntLayoutGroup(fnt_layout_t *layout, font_t *font)
 {
-    font_t *font = fntGet(id);
+    int i, sorted = 1;
 
-    if (!font || !string)
-        return x;
-    fntCheckVideoMode();
+    for (i = 1; i < layout->count; i++) {
+        if (layout->quads[i].atlas < layout->quads[i - 1].atlas) {
+            sorted = 0;
+            break;
+        }
+    }
+    if (!sorted)
+        qsort(layout->quads, layout->count, sizeof(fnt_quad_t), fntCompareQuads);
 
+    layout->runCount = 0;
+    for (i = 0; i < layout->count; i++) {
+        if (!layout->runCount || layout->quads[i].atlas != layout->quads[i - 1].atlas) {
+            layout->runs[layout->runCount].atlas = font->atlases[layout->quads[i].atlas];
+            layout->runs[layout->runCount].start = i;
+            layout->runs[layout->runCount].count = 0;
+            layout->runCount++;
+        }
+        layout->runs[layout->runCount - 1].count++;
+    }
+}
+
+static int fntLayoutBuild(fnt_layout_t *layout, font_t *font, int id, short aligned,
+    size_t width, size_t height, const char *string, float scale)
+{
     int line_height = fntLineHeight(font, scale);
     int text_height = (int)(font->size * scale) + (fntCountLines(string) - 1) * line_height;
+    int x = 0, y = 0;
+
+    layout->valid = 0;
+    layout->count = 0;
+    layout->runCount = 0;
+    layout->endX = 0;
+    // one quad per byte at most: spaces and UTF-8 continuation bytes use none
+    if (!fntLayoutReserve(layout, strlen(string)))
+        return 0;
 
     if (aligned & ALIGN_VCENTER)
         y += ((int)height - text_height) >> 1;
@@ -669,24 +786,17 @@ int fntRenderString(int id, int x, int y, short aligned, size_t width, size_t he
 
     uint32_t codepoint, state = UTF8_ACCEPT;
     FT_UInt previous = 0;
+    const char *text = string;
 
-    owl_packet *packet = NULL;
-    GSSURFACE *tex = NULL;
-    const char *text_to_render = string;
-    owl_qword *last_cnt = NULL, *last_direct = NULL, *last_prim = NULL,
-        *before_first_draw = NULL, *after_draw = NULL;
-    int text_size = 0, texture_id = -1;
-    bool started_rendering = false;
-
-    for (; *text_to_render; ++text_to_render) {
-        if (*text_to_render == '\n') {
+    for (; *text; ++text) {
+        if (*text == '\n') {
             y += line_height;
-            pen_x = fntAlignLine(font, scale, text_to_render + 1, x, aligned);
+            pen_x = fntAlignLine(font, scale, text + 1, x, aligned);
             previous = 0;
             state = UTF8_ACCEPT;
             continue;
         }
-        if (utf8Decode(&state, &codepoint, *text_to_render)) // accumulate the codepoint value
+        if (utf8Decode(&state, &codepoint, *text)) // accumulate the codepoint value
             continue;
 
         fnt_glyph_cache_entry_t *glyph = fntCacheGlyph(font, codepoint);
@@ -701,123 +811,250 @@ int fntRenderString(int id, int x, int y, short aligned, size_t width, size_t he
             y += line_height;
         }
 
-        if (glyph->allocation) {
-            if (tex != &glyph->atlas->surface || !glyph->atlas->surface.Vram) {
-                tex = &glyph->atlas->surface;
+        if (glyph->allocation)
+            fntLayoutAddGlyph(layout, font, glyph, pen_x, y, scale);
 
-                if (started_rendering)
-                    fntFinishRun(last_cnt, last_direct, last_prim, before_first_draw, after_draw, texture_id);
-
-                // Room for every glyph left: spaces, line breaks and UTF-8 continuation bytes excluded
-                text_size = strlen(text_to_render)-count_spaces(text_to_render, " \n")-count_nonascii(text_to_render);
-                int text_vert_size = (text_size*2);
-
-                texture_id = texture_manager_bind(gsGlobal, tex, true);
-
-	            packet = owl_query_packet(CHANNEL_VIF1, (texture_id != -1? 12 : 8)+text_vert_size);
-
-                last_cnt = packet->ptr;
-	            owl_add_cnt_tag(packet, (texture_id != -1? 11 : 7)+text_vert_size, 0); // 4 quadwords for vif
-
-	            if (texture_id != -1) {
-	            	owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 0));
-	            	owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 0));
-	            	owl_add_uint(packet, VIF_CODE(0, 0, VIF_FLUSH, 0));
-	            	owl_add_uint(packet, VIF_CODE(2, 0, VIF_DIRECT, 0));
-
-	            	owl_add_tag(packet, GIF_AD, GIFTAG(1, 1, 0, 0, 0, 1));
-	            	owl_add_tag(packet, GIF_NOP, 0);
-
-	            	owl_add_uint(packet, VIF_CODE(0, 0, VIF_FLUSHA, 0));
-	            	owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 0));
-	            	owl_add_uint(packet, VIF_CODE(texture_id, 0, VIF_MARK, 0));
-	            	owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 1));
-	            }
-
-                last_direct = packet->ptr;
-	            owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 0));
-	            owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 0));
-	            owl_add_uint(packet, VIF_CODE(0, 0, VIF_FLUSHA, 0));
-	            owl_add_uint(packet, VIF_CODE(6+(text_size*2), 0, VIF_DIRECT, 0)); // 3 giftags
-
-	            owl_add_tag(packet, GIF_AD, GIFTAG(4, 1, 0, 0, 0, 1));
-
-	            int tw, th;
-	            athena_set_tw_th(tex, &tw, &th);
-
-	            owl_add_tag(packet,
-	            	GS_TEX0_1,
-	            	GS_SETREG_TEX0((tex->Vram & ~GRAPHICS_TRANSFER_REQUEST_MASK)/256,
-	            				  tex->TBW,
-	            				  tex->PSM,
-	            				  tw, th,
-	            				  gsGlobal->PrimAlphaEnable,
-	            				  COLOR_MODULATE,
-	            				  (tex->VramClut & ~GRAPHICS_TRANSFER_REQUEST_MASK)/256,
-	            				  tex->ClutPSM,
-	            				  0, 0,
-	            				  tex->VramClut? GS_CLUT_STOREMODE_LOAD : GS_CLUT_STOREMODE_NOLOAD)
-	            );
-
-	            owl_add_tag(packet, GS_TEX1_1, GS_SETREG_TEX1(1, 0, tex->Filter, tex->Filter, 0, 0, 0));
-
-                owl_add_tag(packet, GS_PRIM,
-                    VU_GS_PRIM(
-                        GS_PRIM_PRIM_SPRITE,
-                        0,
-                        1,
-                        gsGlobal->PrimFogEnable,
-                        gsGlobal->PrimAlphaEnable,
-                        gsGlobal->PrimAAEnable,
-                        1,
-                        gsGlobal->PrimContext,
-                        0
-                    )
-                );
-
-                owl_add_tag(packet, GS_RGBAQ, colour);
-
-                last_prim = packet->ptr;
-	            owl_add_tag(packet,
-					   ((uint64_t)(GS_UV) << 0 | (uint64_t)(GS_XYZ2) << 4),
-					   	VU_GS_GIFTAG(text_vert_size,
-							1, NO_CUSTOM_DATA, 0,
-							0,
-    						1, 2)
-						);
-
-                before_first_draw = packet->ptr;
-            }
-
-            fntRenderGlyph(glyph, packet, pen_x, y, scale);
-
-            after_draw = packet->ptr;
-
-            started_rendering = true;
-        }
-
-        pen_x += ((int)(glyph->shx*scale) >> 6);
+        pen_x += ((int)(glyph->shx * scale) >> 6);
     }
 
-    if (started_rendering)
-        fntFinishRun(last_cnt, last_direct, last_prim, before_first_draw, after_draw, texture_id);
+    fntLayoutGroup(layout, font);
+    layout->id = id;
+    layout->generation = font->generation;
+    layout->aligned = aligned;
+    layout->width = width;
+    layout->height = height;
+    layout->scale = scale;
+    layout->endX = pen_x;
+    layout->valid = 1;
+    return 1;
+}
 
-    return pen_x;
+int fntLayout(fnt_layout_t *layout, int id, short aligned, size_t width, size_t height,
+    const char *string, float scale)
+{
+    font_t *font = fntGet(id);
+
+    if (!layout)
+        return 0;
+    layout->valid = 0;
+    if (!font || !string)
+        return 0;
+    fntCheckVideoMode();
+    return fntLayoutBuild(layout, font, id, aligned, width, height, string, scale);
+}
+
+int fntLayoutMatches(const fnt_layout_t *layout, int id, short aligned, size_t width,
+    size_t height, float scale)
+{
+    font_t *font = fntGet(id);
+
+    if (!layout || !layout->valid || !font)
+        return 0;
+    // a new video mode rasterizes the glyphs again, in new atlas places
+    fntCheckVideoMode();
+    return layout->id == id && layout->generation == font->generation &&
+        layout->aligned == aligned && layout->width == width &&
+        layout->height == height && layout->scale == scale;
+}
+
+/*
+ * One packet for `count` quads of an atlas, drawn once per pass: the texture
+ * state is sent once, then each pass is its colour and the quads moved by
+ * its offset.
+ */
+static void fntEmitQuads(atlas_t *atlas, const fnt_quad_t *quads, int count,
+    const fnt_pass_t *passes, int pass_count, int x, int y)
+{
+    GSSURFACE *tex = &atlas->surface;
+    int texture_id, upload, gif_size, body_size, tw, th, pass, i;
+    owl_packet *packet;
+
+    texture_id = texture_manager_bind(gsGlobal, tex, true);
+    if (texture_id == GRAPHICS_BIND_ERROR)
+        return;
+    upload = texture_id >= 0;
+
+    // TEX0, TEX1 and PRIM; per pass, RGBAQ and the UV/XYZ2 pairs
+    gif_size = 4 + pass_count * (3 + 2 * count);
+    body_size = (upload ? 4 : 0) + 1 + gif_size;
+
+    packet = owl_query_packet(CHANNEL_VIF1, body_size + 1);
+    owl_add_cnt_tag(packet, body_size, 0);
+
+    if (upload) {
+        owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 0));
+        owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 0));
+        owl_add_uint(packet, VIF_CODE(0, 0, VIF_FLUSH, 0));
+        owl_add_uint(packet, VIF_CODE(2, 0, VIF_DIRECT, 0));
+
+        owl_add_tag(packet, GIF_AD, GIFTAG(1, 1, 0, 0, 0, 1));
+        owl_add_tag(packet, GIF_NOP, 0);
+
+        owl_add_uint(packet, VIF_CODE(0, 0, VIF_FLUSHA, 0));
+        owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 0));
+        owl_add_uint(packet, VIF_CODE(texture_id, 0, VIF_MARK, 0));
+        owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 1));
+    }
+
+    owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 0));
+    owl_add_uint(packet, VIF_CODE(0, 0, VIF_NOP, 0));
+    owl_add_uint(packet, VIF_CODE(0, 0, VIF_FLUSHA, 0));
+    owl_add_uint(packet, VIF_CODE(gif_size, 0, VIF_DIRECT, 0));
+
+    owl_add_tag(packet, GIF_AD, GIFTAG(3, 1, 0, 0, 0, 1));
+
+    athena_set_tw_th(tex, &tw, &th);
+    owl_add_tag(packet,
+        GS_TEX0_1,
+        GS_SETREG_TEX0((tex->Vram & ~GRAPHICS_TRANSFER_REQUEST_MASK)/256,
+                      tex->TBW,
+                      tex->PSM,
+                      tw, th,
+                      gsGlobal->PrimAlphaEnable,
+                      COLOR_MODULATE,
+                      (tex->VramClut & ~GRAPHICS_TRANSFER_REQUEST_MASK)/256,
+                      tex->ClutPSM,
+                      0, 0,
+                      tex->VramClut? GS_CLUT_STOREMODE_LOAD : GS_CLUT_STOREMODE_NOLOAD)
+    );
+    owl_add_tag(packet, GS_TEX1_1, GS_SETREG_TEX1(1, 0, tex->Filter, tex->Filter, 0, 0, 0));
+    owl_add_tag(packet, GS_PRIM,
+        VU_GS_PRIM(
+            GS_PRIM_PRIM_SPRITE,
+            0,
+            1,
+            gsGlobal->PrimFogEnable,
+            gsGlobal->PrimAlphaEnable,
+            gsGlobal->PrimAAEnable,
+            1,
+            gsGlobal->PrimContext,
+            0
+        )
+    );
+
+    for (pass = 0; pass < pass_count; pass++) {
+        float ox = (float)x + passes[pass].dx;
+        float oy = (float)y + passes[pass].dy;
+
+        owl_add_tag(packet, GIF_AD, GIFTAG(1, 1, 0, 0, 0, 1));
+        owl_add_tag(packet, GS_RGBAQ, passes[pass].colour);
+        owl_add_tag(packet,
+            ((uint64_t)(GS_UV) << 0 | (uint64_t)(GS_XYZ2) << 4),
+            VU_GS_GIFTAG(2 * count, 1, NO_CUSTOM_DATA, 0, 0, 1, 2));
+
+        for (i = 0; i < count; i++) {
+            const fnt_quad_t *quad = &quads[i];
+            owl_add_tag(packet,
+                (uint64_t)(owl_coord_transform(quad->x1 + ox, gsGlobal->OffsetX)) |
+                ((uint64_t)(owl_coord_transform(quad->y1 + oy, gsGlobal->OffsetY)) << 16),
+                quad->uv1);
+            owl_add_tag(packet,
+                (uint64_t)(owl_coord_transform(quad->x2 + ox, gsGlobal->OffsetX)) |
+                ((uint64_t)(owl_coord_transform(quad->y2 + oy, gsGlobal->OffsetY)) << 16),
+                quad->uv2);
+        }
+    }
+}
+
+/* Quads of `pass_count` passes that fit in one packet of the packet buffer. */
+static int fntQuadsPerPacket(int pass_count)
+{
+    owl_controller *controller = owl_get_controller();
+    // cnt tag, texture upload, DIRECT, TEX0/TEX1/PRIM, a spare quadword for the end tag
+    int fixed = 1 + 4 + 1 + 4 + 1 + pass_count * 3;
+
+    if (!controller || (int)controller->size <= fixed)
+        return 0;
+    return ((int)controller->size - fixed) / (2 * pass_count);
+}
+
+static void fntEmitPasses(const fnt_layout_t *layout, const fnt_pass_t *passes, int pass_count,
+    int x, int y)
+{
+    int capacity = fntQuadsPerPacket(pass_count);
+    int r, offset;
+
+    if (capacity <= 0)
+        return;
+    for (r = 0; r < layout->runCount; r++) {
+        for (offset = 0; offset < layout->runs[r].count; offset += capacity) {
+            int count = layout->runs[r].count - offset;
+            if (count > capacity)
+                count = capacity;
+            fntEmitQuads(layout->runs[r].atlas, layout->quads + layout->runs[r].start + offset,
+                count, passes, pass_count, x, y);
+        }
+    }
+}
+
+void fntLayoutDraw(const fnt_layout_t *layout, int x, int y, u64 colour, float outline,
+    u64 outline_colour, float dropshadow, u64 dropshadow_colour)
+{
+    fnt_pass_t passes[5];
+    int pass_count = 0, p;
+
+    if (!layout || !layout->valid || !layout->count)
+        return;
+
+    if (outline > 0.0f) {
+        const float offsets[4][2] = { {outline, outline}, {outline, -outline}, {-outline, outline}, {-outline, -outline} };
+        for (p = 0; p < 4; p++)
+            passes[pass_count++] = (fnt_pass_t){ offsets[p][0], offsets[p][1], outline_colour };
+    } else if (dropshadow > 0.0f) {
+        passes[pass_count++] = (fnt_pass_t){ dropshadow, dropshadow, dropshadow_colour };
+    }
+    passes[pass_count++] = (fnt_pass_t){ 0.0f, 0.0f, colour };
+
+    /*
+     * Glyphs of one atlas do not overlap each other's copies in a way that
+     * matters, but an outline of a second atlas must not cover the text of
+     * the first: with several atlases, every pass is drawn over all of them
+     * before the next one.
+     */
+    if (layout->runCount == 1) {
+        fntEmitPasses(layout, passes, pass_count, x, y);
+    } else {
+        for (p = 0; p < pass_count; p++)
+            fntEmitPasses(layout, &passes[p], 1, x, y);
+    }
+}
+
+int fntRenderString(int id, int x, int y, short aligned, size_t width, size_t height, const char *string, float scale, u64 colour)
+{
+    if (!fntLayout(&fntScratch, id, aligned, width, height, string, scale))
+        return x;
+    fntLayoutDraw(&fntScratch, x, y, colour, 0.0f, 0, 0.0f, 0);
+    return x + fntScratch.endX;
 }
 
 int fntRenderStringPlus(int id, int x, int y, short aligned, size_t width, size_t height, const char *string, float scale, u64 colour, float outline, u64 outline_colour, float dropshadow, u64 dropshadow_colour) {
-    if (outline > 0.0f) {
-        float offsets[][2] = { {outline, outline}, {outline, -outline}, {-outline, outline}, {-outline, -outline} };
-
-	    for(int i = 0; i < 4; i++){
-            fntRenderString(id, x+offsets[i][0], y+offsets[i][1], aligned, width, height, string, scale, outline_colour);
-	    }
-    } else if (dropshadow > 0.0f) {
-        fntRenderString(id, x+dropshadow, y+dropshadow, aligned, width, height, string, scale, dropshadow_colour);
-    }
-
-    fntRenderString(id, x, y, aligned, width, height, string, scale, colour);
+    if (fntLayout(&fntScratch, id, aligned, width, height, string, scale))
+        fntLayoutDraw(&fntScratch, x, y, colour, outline, outline_colour, dropshadow, dropshadow_colour);
     return 0;
+}
+
+int fntPreload(int id, const char *text, int *offset, float budget_ms)
+{
+    font_t *font = fntGet(id);
+    uint64_t start = GetTimerSystemTime();
+    uint64_t budget = budget_ms > 0.0f ? (uint64_t)(budget_ms * (kBUSCLK / 1000)) : 0;
+    uint32_t codepoint, state = UTF8_ACCEPT;
+    int position = *offset;
+
+    if (!font || !text)
+        return 1;
+    fntCheckVideoMode();
+    while (text[position]) {
+        if (utf8Decode(&state, &codepoint, text[position++]))
+            continue;
+        *offset = position;
+        if (codepoint != '\n')
+            fntCacheGlyph(font, codepoint);
+        if (budget && GetTimerSystemTime() - start >= budget)
+            return !text[position];
+    }
+    *offset = position;
+    return 1;
 }
 
 int fntCalcDimensions(int id, float scale, const char *str)

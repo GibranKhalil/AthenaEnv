@@ -384,7 +384,7 @@ const char* run_script(const char* script, bool isBuffer)
     athena_js_gil_set_runtime(rt);
     /*
      * QuickJS assumes 256 KB of stack; the main thread has get_stack_size()
-     * (128 KB). Past this budget deep recursion throws a catchable
+     * (MAIN_STACK_SIZE in the Makefile). Past this budget deep recursion throws a catchable
      * "stack overflow" instead of overwriting the memory below the stack.
      */
     athena_js_gil_set_stack_budget(get_stack_size() - MAIN_STACK_RESERVE);
@@ -429,6 +429,17 @@ const char* run_script(const char* script, bool isBuffer)
                 script);
         } else {
             JSValue exception_val = JS_GetException(ctx);
+            /*
+             * No exception object: memory ran out so completely that the
+             * error itself could not be created, or the event loop already
+             * printed an error from a promise job to the output.
+             */
+            if (JS_IsNull(exception_val) || JS_IsUndefined(exception_val)) {
+                snprintf(error_buf, sizeof(error_buf), "%s",
+                    "InternalError: the script stopped without an error object: out of memory, "
+                    "or an error printed above in its output");
+                goto teardown;
+            }
             const char* exception = JS_ToCString(ctx, exception_val);
             JSValue stack_val = JS_GetPropertyStr(ctx, exception_val, "stack");
             const char* stack = JS_ToCString(ctx, stack_val);
@@ -442,7 +453,8 @@ const char* run_script(const char* script, bool isBuffer)
             JS_FreeValue(ctx, exception_val);
             JS_FreeValue(ctx, stack_val);
         }
-        
+
+    teardown:
         dbgprintf("[AthenaCore] Destroying QuickJS runtime after error\n");
         athena_js_gil_unlock();
         athena_modules_quiesce();

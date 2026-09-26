@@ -457,6 +457,22 @@ void printFontTextPlus(GSFONT* font, const char* text, float x, float y, float s
 	athena_font_print_scaled(gsGlobal, font, draw_x - 0.5f, draw_y - 0.5f, 1, scale, color, text);
 }
 
+void athena_bitmap_font_discard(GSFONT *font)
+{
+	if (!font)
+		return;
+	if (font->Texture) {
+		free(font->Texture->Mem);
+		free(font->Texture->Clut);
+		free(font->Texture);
+	}
+	free(font->RawData);
+	free(font->Path);
+	free(font->Path_DAT);
+	free(font->Additional);
+	free(font);
+}
+
 void unloadFont(GSFONT* font)
 {
 	if (!font) {

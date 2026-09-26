@@ -1,8 +1,10 @@
 /*
- * Font: sizes, sharing, free(), multi-line text, and Font.loadAsync on the
- * shared job pool (the frame loop keeps running while the file is read).
+ * Font: sizes, sharing, free(), multi-line text, Font.loadAsync on the
+ * shared job pool (the frame loop keeps running while the file is read or
+ * the bitmap decoded), preload() and FontRender layouts.
  */
 const TTF = "tests/font/Quicksand-Regular.ttf";
+const BITMAP = "tests/font/bitmap.png";   // with bitmap.dat, from tests/font/make_fixtures.js
 let passed = 0, failed = 0;
 
 function check(name, condition) {
@@ -73,8 +75,71 @@ async function asyncTests() {
     let rejected = false;
     try { await missing; } catch (error) { rejected = /Unable to load font/.test(String(error)); }
     check("missing file rejects", rejected);
-    throws("bitmap fonts are not async", () => Font.loadAsync("tests/font.png"), /new Font/);
     throws("Font.poll of another job", () => Font.poll({}), /expected a Font job/);
+
+    // Bitmap fonts: the image and widths are decoded on the pool.
+    const bitmap = await Font.loadAsync(BITMAP);
+    check("bitmap loadAsync resolves with a Font", bitmap instanceof Font && bitmap.size === 0);
+    check("bitmap widths from the .dat", bitmap.getTextSize("AB").width === 21);
+    check("same widths as new Font()", new Font(BITMAP).getTextSize("Hello").width ===
+        bitmap.getTextSize("Hello").width);
+    bitmap.print(10, 10, "AB");
+    bitmap.free();
+    let bitmapRejected = false;
+    try { await Font.loadAsync("tests/font/missing.png"); } catch (error) { bitmapRejected = /Unable to load font/.test(String(error)); }
+    check("missing bitmap rejects", bitmapRejected);
+
+    // preload(): the glyphs are rasterized ahead, a slice per frame.
+    const warm = new Font(TTF, { size: 44 });
+    check("preload resolves with the font", (await warm.preload("0123456789")) === warm);
+    check("preload of all ASCII", (await warm.preload()) === warm);
+    check("budgetMs 0 finishes during the call", (await warm.preload("xyz", { budgetMs: 0 })) === warm);
+    check("Font.ASCII", Font.ASCII.length === 95 && Font.ASCII[0] === " " && Font.ASCII[94] === "~");
+    throws("negative budgetMs", () => warm.preload("a", { budgetMs: -1 }), /RangeError/);
+    throws("preload characters", () => warm.preload(42), /TypeError/);
+    const bitmapPreload = new Font(BITMAP);
+    check("bitmap preload resolves at once", (await bitmapPreload.preload()) === bitmapPreload);
+
+    // Freed while its slices were still coming.
+    const doomed = new Font(TTF, { size: 70 });
+    const pending = doomed.preload(Font.ASCII, { budgetMs: 0.001 });
+    doomed.free();
+    let freedRejected = false;
+    try { await pending; } catch (error) { freedRejected = /freed/.test(String(error)); }
+    check("preload rejects once the font is freed", freedRejected);
+    warm.free();
+
+    // The first print of new glyphs rasterizes them; after preload() it does not.
+    const cold = new Font(TTF, { size: 60 });
+    let start = System.getMilliseconds();
+    cold.print(0, 100, Font.ASCII);
+    const coldMs = System.getMilliseconds() - start;
+    const ready = await Font.loadAsync(TTF, { size: 61, preload: true, budgetMs: 1 });
+    start = System.getMilliseconds();
+    ready.print(0, 100, Font.ASCII);
+    const readyMs = System.getMilliseconds() - start;
+    console.log(`[INFO] first print of Font.ASCII: ${coldMs} ms cold, ${readyMs} ms after preload`);
+    check("loadAsync with preload resolves with a Font", ready instanceof Font && ready.size === 61);
+    throws("preload option type", () => Font.loadAsync(TTF, { preload: 5 }), /TypeError/);
+    const waited = Font.wait(Font.loadAsync(TTF, { size: 62, preload: "abc" }), 5000);
+    check("wait finishes the preload: " + waited.state, waited.state === "done" && waited.result.size === 62);
+    cold.free();
+    ready.free();
+    waited.result.free();
+
+    // FontRender keeps its layout; changing scale, align or outline still prints.
+    const label = new Font(TTF, { size: 24 });
+    const hud = label.render("Score: 12345\nLives: 3");
+    label.outline = 2;
+    for (let i = 0; i < 3; i++) hud.print(20, 300);
+    label.scale = 1.5;
+    label.align = Font.ALIGN_CENTER;
+    hud.print(320, 300);
+    label.outline = 0;
+    label.dropshadow = 2;
+    hud.print(320, 300);
+    check("FontRender prints after changes", true);
+    label.free();
 
     const cancelled = Font.loadAsync(TTF, { size: 40 });
     cancelled.cancel();

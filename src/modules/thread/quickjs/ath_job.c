@@ -19,6 +19,7 @@ typedef struct {
     AthenaJob *job;
     void *user;
     bool settled;
+    bool cancelled;             /* cancel() was called: stops the script-thread part (kind->advance) */
     AthenaJobState state;       /* once settled; FAILED also when settle() reported a failure */
     JSValue outcome;            /* value or error once settled */
     JSValue promise;            /* created by the first then() */
@@ -130,6 +131,20 @@ static int js_job_settle(JSContext *ctx, JsJob *handle) {
     state = athena_job_state(handle->job, &result);
     if (state == ATHENA_JOB_RUNNING)
         return 0;
+    if (state == ATHENA_JOB_DONE && handle->kind->advance && handle->cancelled) {
+        /* The worker was done, but not the script-thread part: that is what stops. */
+        state = ATHENA_JOB_CANCELLED;
+    } else if (state == ATHENA_JOB_DONE && handle->kind->advance) {
+        int busy = handle->kind->advance(ctx, handle->job, handle->user);
+        if (busy > 0)
+            return 0;
+        if (busy < 0) {
+            handle->outcome = JS_GetException(ctx);
+            handle->state = ATHENA_JOB_FAILED;
+            handle->settled = true;
+            return 0;
+        }
+    }
     if (handle->kind->settle(ctx, handle->job, state, result, handle->user, &outcome, &failed) < 0) {
         JS_FreeValue(ctx, outcome);
         return -1;
@@ -183,6 +198,11 @@ static JSValue js_job_do_wait(JSContext *ctx, JsJob *handle, int argc, JSValueCo
     athena_js_gil_unlock();
     athena_job_wait(handle->job, timeout);
     athena_js_gil_lock();
+    /* The script-thread part (kind->advance) is finished here, whatever the timeout. */
+    while (!handle->settled && athena_job_state(handle->job, NULL) != ATHENA_JOB_RUNNING) {
+        if (js_job_settle(ctx, handle) < 0)
+            return JS_EXCEPTION;
+    }
     return js_job_status(ctx, handle);
 }
 
@@ -204,6 +224,7 @@ JSValue athena_js_job_cancel(JSContext *ctx, JSValueConst job, const AthenaJsJob
 
     if (!handle)
         return JS_EXCEPTION;
+    handle->cancelled = true;
     if (handle->kind->cancel)
         handle->kind->cancel(handle->job, handle->user);
     else
@@ -245,12 +266,13 @@ static JSValue js_job_tick(JSContext *ctx, JSValueConst this_val, int argc, JSVa
 
     if (!handle || JS_IsUndefined(handle->resolve))
         return JS_UNDEFINED;
-    if (!handle->settled && athena_job_state(handle->job, NULL) == ATHENA_JOB_RUNNING)
-        return js_job_schedule(ctx, data[0], JOB_TICK_MS) < 0 ? JS_EXCEPTION : JS_UNDEFINED;
 
     if (js_job_settle(ctx, handle) < 0) {
         func = handle->reject;
         value = JS_GetException(ctx);
+    } else if (!handle->settled) {
+        /* Still running: the worker, or the script-thread part (kind->advance). */
+        return js_job_schedule(ctx, data[0], JOB_TICK_MS) < 0 ? JS_EXCEPTION : JS_UNDEFINED;
     } else {
         func = handle->state == ATHENA_JOB_DONE ? handle->resolve : handle->reject;
         value = JS_DupValue(ctx, handle->outcome);

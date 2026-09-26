@@ -38,6 +38,8 @@ typedef struct AthenaFontRender {
     AthenaFont *font;
     char *text;
     Coords size;
+    /* TrueType: the glyphs placed once, laid out again only when the font's scale, alignment or glyph cache changes */
+    struct fnt_layout *layout;
 } AthenaFontRender;
 
 AthenaFont *athena_font_load(const char *path);
@@ -54,6 +56,14 @@ AthenaFont *athena_font_load_ex(const char *path, int size, int *error);
  */
 AthenaFont *athena_font_from_memory(const char *path, void *data, int data_size,
     int size, int *error);
+/* Wraps a bitmap font decoded by loadFont() (on any thread); takes it. NULL when out of memory. */
+AthenaFont *athena_font_from_bitmap(GSFONT *data);
+/*
+ * Rasterizes the glyphs of `text` into the cache from byte `*offset`, for up
+ * to `budget_ms` (no limit when <= 0). 1 once done, 0 when some remain;
+ * bitmap fonts have nothing to rasterize.
+ */
+int athena_font_preload(AthenaFont *font, const char *text, int *offset, float budget_ms);
 /* Distance between two lines of text at the current scale, in pixels. */
 int athena_font_get_line_height(AthenaFont *font);
 void athena_font_destroy(AthenaFont *font);

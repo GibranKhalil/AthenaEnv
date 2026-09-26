@@ -84,6 +84,12 @@ ifneq ($(MODULE_EXPORT_SYMBOLS),1)
   ATHENA_LDFLAGS += -Wl,--gc-sections
 endif
 
+# Main thread stack (the PS2SDK linkfile default is 128 KB). QuickJS takes
+# about 0.4 KB of it per JavaScript call (JS_CallInternal), so 512 KB allows
+# roughly 1200 levels of recursion before a catchable "stack overflow".
+MAIN_STACK_SIZE ?= 0x80000
+ATHENA_LDFLAGS += -Wl,--defsym,_stack_size=$(MAIN_STACK_SIZE)
+
 ifeq ($(DEBUG),1)
   EE_CFLAGS += -DDEBUG
 endif

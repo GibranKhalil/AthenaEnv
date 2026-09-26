@@ -233,7 +233,8 @@ device prefix: `mass:/` (USB), `mc0:/` and `mc1:/` (memory cards), `cdrom0:`
   example), and `std.gc()` on loading screens. Loading an image or font that
   runs out of memory collects garbage and tries once more.
 - Deep recursion throws a catchable `InternalError: stack overflow` before it
-  can overrun the stack: the main thread has 128 KB, and `Thread.new()`
+  can overrun the stack: the main thread has 512 KB (`MAIN_STACK_SIZE` in the
+  Makefile; about 1200 levels of JavaScript recursion), and `Thread.new()`
   threads 32 KB by default.
 
 ### Background jobs
@@ -280,7 +281,7 @@ tables below.
 | [`color`](src/modules/color/color.d.ts) | `Color` | Packing and editing of RGBA colors. |
 | [`image`](src/modules/image/image.d.ts) | `Image` | PNG, JPEG and BMP loading, pixel access and textured drawing with tint, source rectangle and rotation; `drawList()` draws many sprites of one texture at once. |
 | [`imagelist`](src/modules/imagelist/imagelist.d.ts) | `ImageList` | Asynchronous image loading with priorities, deduplication, an LRU cache and an optional decoder thread. |
-| [`font`](src/modules/font/font.d.ts) | `Font` | TrueType fonts at any size, loaded on a worker with `Font.loadAsync()`, and bitmap fonts; multi-line text, kerning, alignment, outline and drop shadow, with square glyphs on NTSC, PAL, 480p and 16:9. |
+| [`font`](src/modules/font/font.d.ts) | `Font` | TrueType and bitmap fonts at any size, loaded on a worker with `Font.loadAsync()`, glyphs preloaded a slice per frame with `preload()`, and cached layouts with `render()`; multi-line text, kerning, alignment, outline and drop shadow, with square glyphs on NTSC, PAL, 480p and 16:9. |
 | [`tilemap`](src/modules/tilemap/tilemap.d.ts) | `TileMap` | VU1-accelerated batched sprites and tilemaps. |
 | [`video`](src/modules/video/video.d.ts) | `Video` | MPEG-1/2 playback on the IPU, drawn directly or used as an `Image`. See [docs/VIDEO.md](docs/VIDEO.md). |
 | `graphics` | — | GS initialization and the rendering core shared by the modules above. |
@@ -637,6 +638,14 @@ as the first script after boot. Key test suites in `bin/tests/` include
 `stack_test.js` (recursion and stack limits), `font_async_test.js` (font
 rasterization and async jobs), `memcard_test.js` (synchronous and async saves)
 and `memory_stats.js`.
+
+`soak_test.js` checks that switching scripts does not leak or hang: it runs
+the heavy scripts of `bin/tests/soak/` (fonts, sound, ImageList, video, jobs,
+threads) six times in a row, each one switching back with `std.reload()` in
+the middle of its work, and compares the EE heap and VRAM at the start of
+every round. It keeps its progress in `bin/tests/soak/state.json`, so run it
+from a writable device (USB or `host:`), and reports in the launcher when
+done.
 
 Test on real hardware before a release: the emulator tolerates misaligned
 memory accesses and provides the `host:` device, which a console does not.

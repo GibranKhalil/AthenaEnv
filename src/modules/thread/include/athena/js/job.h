@@ -44,6 +44,16 @@ typedef struct AthenaJsJobKind {
     void (*release)(AthenaJob *job);
     /* Cancels the job for cancel(); athena_job_cancel when NULL. Optional. */
     void (*cancel)(AthenaJob *job, void *user);
+    /*
+     * Script-thread work that follows a DONE native job and may take several
+     * frames, such as rasterizing a font's glyphs a slice at a time. Called
+     * on each poll or await tick before settle(); returns 1 while work
+     * remains (the job stays "running"), 0 when finished, or -1 with an
+     * exception pending (the job fails with it). wait() calls it until it
+     * finishes; after cancel() it is no longer called and the job ends
+     * cancelled, settle() getting CANCELLED. Optional.
+     */
+    int (*advance)(JSContext *ctx, AthenaJob *job, void *user);
 } AthenaJsJobKind;
 
 /* Registers the Job class on a new context; the thread module does it. */
